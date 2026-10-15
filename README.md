@@ -236,24 +236,34 @@ switching to the next screened move when the chosen one turns out expensive (sim
 
 ### Is a full solution feasible?
 
-A proof that blue wins the game is, for each of red's 12 opening cells, one blue reply, and for every red reply
-to that, one blue answer after which every red move is a unit that blue wins. After the engine's preferred blue
-reply (4 s search), the openings leave 608-1589 red replies each, 15 259 in all; the centre leaves the most:
+The work comes in two kinds of steps, both measured on this laptop (Ryzen 7 250, 8 cores):
+
+- **Settling a red reply that blue wins** (`snek refute` / `snek proveline`: blue's winning answer and the
+  proof that every red follow-up loses): 0.06-3.7 thread-hours for ten red replies to `1:60 4B:16,27,28,39`
+  drawn at random, 0.33 on average over the first 29 replies `proveline` settled in that line once answers that
+  won earlier were tried first. A hard reply is one whose only winning answer ranks deep in the evaluation's
+  order (the stubborn `3V:40,41,50`: about 5 thread-hours).
+- **Showing that blue cannot win a line**: one red reply after which every blue answer is refuted. For
+  `4B:16,27,28,39` that was red's 30th reply in the evaluation's order, `4C:40,41,50,52` (938 refutations,
+  about 2.5 thread-hours); the whole run took about 13 thread-hours.
+
+With every opening's lines at 608-1589 red replies after blue's preferred reply (15 259 in all):
 
 | red's 1-hex | 5 | 6 | 7 | 16 | 17 | 18 | 27 | 28 | 38 | 39 | 49 | 60 |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | red replies after blue's preferred reply | 1338 | 1329 | 1286 | 1240 | 1195 | 1217 | 1289 | 1316 | 1481 | 608 | 1371 | 1589 |
 | engine's chance for blue | 75 % | 77 % | 71 % | 63 % | 67 % | 61 % | 62 % | 70 % | 71 % | 83 % | 78 % | 59 % |
 
-Settling one red reply with `snek refute` (the winning answer and its proof) took, for ten replies to
-`1:60 4B:16,27,28,39` drawn at random, 0.06-3.7 thread-hours: 0.5-3.4 (mean 1.5) for the first four, before
-answers that won against earlier replies were tried first, and 0.06-3.7 (mean 0.84, median 0.27) for the next
-six, five of which fell to such an answer. Hard replies are the ones whose only winners rank deep in the
-evaluation's order (the stubborn `3V:40,41,50`: about 5 thread-hours, of which 4.3 to refute 1017 other moves).
-So, if blue wins, the centre line is about 1589 × (0.84-1.5) ≈ **1.3-2.4·10³ thread-hours** (3-6 days of a
-16-thread laptop, `snek proveline`), and the whole game about **1.3-2.3·10⁴ thread-hours** (1-2 months of the
-laptop, about a day on 1000 cores), plus finding blue's reply to each opening. A drawn game needs strategies for
-both sides and would cost a few times more. These are estimates from samples, not bounds.
+- A proof that blue wins the game (one winning blue reply per opening, every red reply settled) would be
+  about 15 259 × 0.33-1.5 ≈ **0.5-2.3·10⁴ thread-hours**. The centre makes that unlikely: blue's best reply by
+  the engine, `4B:16,27,28,39`, only draws, and the engine rates every other reply at 50 % or less.
+- Showing that the centre is not a blue win means one holding red reply for each of blue's 172 distinct
+  replies: at about 13 thread-hours each, **about 2·10³ thread-hours**, less where red's hold comes early.
+- If the game is a draw, the proof is that, plus a drawing blue reply to each opening with every red reply
+  answered by a blue move that does not lose (about 15 259 × 0.33 ≈ 5·10³): **about 10⁴ thread-hours**, a few
+  weeks of one 16-thread laptop or under a day on 1000 cores.
+
+These are estimates from samples, not bounds.
 
 ## Distributed solve of the centre opening (`dist/`)
 
