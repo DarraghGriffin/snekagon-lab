@@ -17,16 +17,17 @@ static double secondsSince(std::chrono::steady_clock::time_point start) {
 static const char* resultWord(int value, bool lossTest) { return value > 0 ? "win" : value < 0 ? "loss" : lossTest ? "notloss" : "draw"; }
 
 // Root moves already solved by an earlier run, read from a progress file
-// (lines "<move> <win|draw|loss|notloss> <nodes> <seconds>"; notloss counts as 0).
-static std::vector<std::pair<Move, int>> readProgress(const char* path) {
+// (lines "<move> <win|draw|loss|notloss> <nodes> <seconds>"). A "notloss" line, written by a
+// SOLVER_WIN_TEST run, counts as 0 in a loss test but is no exact value: an exact run solves it again.
+static std::vector<std::pair<Move, int>> readProgress(const char* path, bool lossTest) {
     std::vector<std::pair<Move, int>> solved;
     std::ifstream in(path);
     std::string line, moveText, valueText;
     while (std::getline(in, line)) {
         std::istringstream fields(line);
         Move m;
-        if (fields >> moveText >> valueText && parseMove(moveText, m))
-            solved.push_back({m, valueText == "win" ? 1 : valueText == "loss" ? -1 : 0});
+        if (!(fields >> moveText >> valueText) || !parseMove(moveText, m) || (valueText == "notloss" && !lossTest)) continue;
+        solved.push_back({m, valueText == "win" ? 1 : valueText == "loss" ? -1 : 0});
     }
     return solved;
 }
@@ -48,7 +49,7 @@ int cmdSolvePos(const Args& args) {
     std::vector<std::pair<Move, int>> alreadySolved;
     FILE* progress = nullptr;
     if (const char* progressPath = getenv("PROGRESS")) {
-        alreadySolved = readProgress(progressPath);
+        alreadySolved = readProgress(progressPath, lossTest);
         if (!alreadySolved.empty()) printf("resuming: %zu root moves already solved\n", alreadySolved.size());
         progress = fopen(progressPath, "a");
     }
@@ -72,9 +73,13 @@ int cmdSolvePos(const Args& args) {
 
     int known = 0;
     for (auto& [move, value] : result.perMove) known += value != Solver::UNKNOWN;
-    printf("ply %d stm %d: value %s  (%d/%zu root moves solved, %llu nodes, %.1fs)\n", (int)pos.ply, (int)pos.sideToMove,
-           result.value == Solver::UNKNOWN ? "unknown" : std::to_string(result.value).c_str(), known, result.perMove.size(),
-           (unsigned long long)result.nodes, result.seconds);
+    // the loss test answers "loses" or "does not lose", never an exact value (ui/server.js reads "value")
+    std::string verdict = result.value == Solver::UNKNOWN ? "value unknown"
+                          : !lossTest                     ? "value " + std::to_string(result.value)
+                          : result.value < 0              ? "loses"
+                                                          : "does not lose";
+    printf("ply %d stm %d: %s  (%d/%zu root moves solved, %llu nodes, %.1fs)\n", (int)pos.ply, (int)pos.sideToMove, verdict.c_str(),
+           known, result.perMove.size(), (unsigned long long)result.nodes, result.seconds);
     for (auto& [move, value] : result.perMove)
         if (value != Solver::UNKNOWN) printf("  %-22s %s\n", moveToString(move).c_str(), resultWord(value, lossTest));
     return 0;

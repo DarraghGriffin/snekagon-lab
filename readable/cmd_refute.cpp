@@ -22,6 +22,11 @@ static bool playMoves(const Args& args, int firstMove, Position& pos) {
 
 // ---- refute ----------------------------------------------------------------------------------
 
+// First line of a refute log: the position, the question (REFUTE_LOSS) and SOLVER_RED_BONUS.
+static std::string refuteLogHeader(const Position& pos) {
+    return "# refute " + positionToString(pos) + " loss " + std::to_string(envInt("REFUTE_LOSS", 0) != 0) + " bonus " + std::to_string(RED_BONUS);
+}
+
 // snek refute <threads> <log> <move>...
 // Does the side to move after the given moves win, or can each of its moves be refuted? With env
 // REFUTE_LOSS=1: does it avoid losing, or can each move be refuted with a loss? REFUTE_FIRST=<file>
@@ -38,7 +43,8 @@ int cmdRefute(const Args& args) {
         while (in >> move) first.push_back(move);
     }
     bool mustLose = envInt("REFUTE_LOSS", 0) != 0;
-    RefuteResult r = refuteMoves(pos, threads, args.arg(3, ""), first);
+    RefuteResult r = refuteMoves(pos, threads, args.arg(3, ""), refuteLogHeader(pos), first);
+    if (!r.error.empty()) { printf("%s\n", r.error.c_str()); return 1; }
     if (!r.survivor.empty()) printf("the side to move %s with %s\n", mustLose ? "does not lose" : "WINS", r.survivor.c_str());
     else if (r.refuted == r.total) printf("the side to move %s: all %zu moves refuted\n", mustLose ? "LOSES" : "cannot win", r.total);
     else printf("%zu of %zu moves refuted, rest unknown\n", r.refuted, r.total);
@@ -67,6 +73,17 @@ int cmdProveLine(const Args& args) {
     if (!playMoves(args, 4, pos)) return 1;
     std::filesystem::create_directories(dir);
     std::string summaryPath = dir + "/summary.txt";
+    std::string header = "# proveline " + positionToString(pos) + " bonus " + std::to_string(RED_BONUS);
+    std::string existing = firstLineOf(summaryPath);
+    if (!existing.empty() && existing != header) {
+        printf("%s starts with \"%s\", not \"%s\"\n", summaryPath.c_str(), existing.c_str(), header.c_str());
+        return 1;
+    }
+    if (existing.empty()) {
+        FILE* summary = fopen(summaryPath.c_str(), "a");
+        fprintf(summary, "%s\n", header.c_str());
+        fclose(summary);
+    }
 
     // what earlier runs settled, and the answers that won (most recent first)
     std::map<std::string, std::string> settled;  // defender reply -> "wins" or "holds"
@@ -77,7 +94,7 @@ int cmdProveLine(const Args& args) {
         while (std::getline(in, line)) {
             std::istringstream fields(line);
             std::string reply, state, answer;
-            if (!(fields >> reply >> state)) continue;
+            if (line[0] == '#' || !(fields >> reply >> state)) continue;  // the header
             settled[reply] = state;
             if (state == "wins" && fields >> answer && std::find(winningAnswers.begin(), winningAnswers.end(), answer) == winningAnswers.end())
                 winningAnswers.insert(winningAnswers.begin(), answer);
@@ -107,7 +124,8 @@ int cmdProveLine(const Args& args) {
         std::replace(logName.begin(), logName.end(), ':', '_');
         std::replace(logName.begin(), logName.end(), ',', '_');
         auto start = std::chrono::steady_clock::now();
-        RefuteResult r = refuteMoves(afterReply, threads, dir + "/" + logName + ".log", winningAnswers);
+        RefuteResult r = refuteMoves(afterReply, threads, dir + "/" + logName + ".log", refuteLogHeader(afterReply), winningAnswers);
+        if (!r.error.empty()) { printf("%s\n", r.error.c_str()); return 1; }
         double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
         bool attackerWins = !r.survivor.empty(), attackerCannotWin = r.refuted == r.total;

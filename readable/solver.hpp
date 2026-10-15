@@ -65,9 +65,10 @@ inline bool lastPiecesValue(const Position& pos, int& value) {
         Bitboard blockedBy;  // any of our cells here makes the reply illegal
         int length;
     };
-    constexpr int MAX_REPLIES = 512;
+    constexpr int MAX_REPLIES = 512;  // positions reachable in play have at most 468 (41+ cells filled)
     Reply replies[MAX_REPLIES];
     int replyCount = 0;
+    bool overflow = false;
     if (pos.piecesLeft[opp]) {
         Position asOpponent = pos;
         asOpponent.sideToMove = opp;
@@ -77,9 +78,11 @@ inline bool lastPiecesValue(const Position& pos, int& value) {
             int length = longestSnakeAfter(pos, opp, p);
             // a reply that grows an opponent snake is blocked only by covering it; a new snake
             // also by touching it
-            if (length > pos.longestSnake[opp] && replyCount < MAX_REPLIES)
-                replies[replyCount++] = Reply{p.border & occupied ? p.cells : p.cells | p.border, length};
+            if (length <= pos.longestSnake[opp]) return;
+            if (replyCount == MAX_REPLIES) { overflow = true; return; }
+            replies[replyCount++] = Reply{p.border & occupied ? p.cells : p.cells | p.border, length};
         });
+        if (overflow) return false;  // more replies than the list holds: leave it to the search
         std::sort(replies, replies + replyCount, [](const Reply& a, const Reply& b) { return a.length > b.length; });
     }
     auto opponentLength = [&](Bitboard ourCells) {

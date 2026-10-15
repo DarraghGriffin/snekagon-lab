@@ -44,7 +44,17 @@ struct RefuteResult {
     std::string survivor;  // an attacker move that survives (wins, or holds with REFUTE_LOSS); empty if none
     size_t refuted = 0;    // attacker moves refuted
     size_t total = 0;      // attacker moves (symmetric duplicates removed)
+    std::string error;     // the log belongs to another position or question: nothing was done
 };
+
+// The first line of a file, or "" if it is missing or empty.
+inline std::string firstLineOf(const std::string& path) {
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return line;
+}
 
 class RefutationSweep {
   public:
@@ -57,9 +67,18 @@ class RefutationSweep {
 
     RefutationSweep(const Position& root, int threads) : root(root), threads(threads) {}
 
-    RefuteResult run(const std::string& logPath, const std::vector<std::string>& first) {
+    // header: the log's first line, naming the position, the question and the bonus. A log that starts
+    // with anything else is not resumed: a refutation of "wins" must never count as one of "loses".
+    RefuteResult run(const std::string& logPath, const std::string& header, const std::vector<std::string>& first) {
+        std::string existing = firstLineOf(logPath);
+        if (!existing.empty() && existing != header) {
+            RefuteResult wrongLog;
+            wrongLog.error = logPath + " starts with \"" + existing + "\", not \"" + header + "\"";
+            return wrongLog;
+        }
         readLog(logPath);
         log = fopen(logPath.c_str(), "a");
+        if (existing.empty()) { fprintf(log, "%s\n", header.c_str()); fflush(log); }
         std::vector<Move> all = symmetryUniqueMoves(root);
         bestFirst = attackerMovesBestFirst(all);
         std::vector<Move> todo;  // not settled by an earlier run
@@ -119,7 +138,7 @@ class RefutationSweep {
         while (std::getline(in, line)) {
             std::istringstream fields(line);
             std::string move, state, reply;
-            if (!(fields >> move >> state)) continue;
+            if (line[0] == '#' || !(fields >> move >> state)) continue;  // the header
             status[move] = state;
             Move replyMove;
             if (state == "refuted" && fields >> reply && parseMove(reply, replyMove)) refutations[replyMove.placementId]++;
@@ -250,6 +269,7 @@ class RefutationSweep {
 
 // Settles the attacker's moves after `root` (`first` before all others) until one survives or all
 // are refuted, logging to and resuming from `logPath`.
-inline RefuteResult refuteMoves(const Position& root, int threads, const std::string& logPath, const std::vector<std::string>& first = {}) {
-    return RefutationSweep(root, threads).run(logPath, first);
+inline RefuteResult refuteMoves(const Position& root, int threads, const std::string& logPath, const std::string& header,
+                                const std::vector<std::string>& first = {}) {
+    return RefutationSweep(root, threads).run(logPath, header, first);
 }
