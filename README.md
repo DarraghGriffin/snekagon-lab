@@ -144,16 +144,16 @@ to answer every move. That first winning move, however, rarely has the smallest 
 ### Win test: cheapest proofs first (`pns.hpp`)
 
 A distributed unit only asks whether blue wins (`snek worker` still computes the full value). `PnSearch`
-answers that question with ~3x fewer nodes than the alpha-beta win test (`BENCH_WINTEST=1`, window (0, 1)),
-from two changes:
+(`BENCH_WINTEST=1 BENCH_PNS=1`) answers that question with two changes to the alpha-beta win test
+(`BENCH_WINTEST=1`, window (0, 1)):
 
 - **Ordering of the alpha-beta probes.** Without history scores and with killers behind the learned-eval
   ordering (`SOLVER_HISTORY=0 SOLVER_KILLERS_OVER_EVAL=0`, the defaults inside `PnSearch`; the plain solver
-  keeps its ordering unless these are set), the win test needs half the nodes (the full-value solve too:
-  48.1 M → 22.3 M nodes on the benchmark): a move that made cutoffs in one subtree usually still wins in
-  the next, but with a much bigger proof than other winning moves.
-- **Proof-cost ordering at the root.** Of the eval's 40 best blue moves in a unit, 10-32 win, and
-  together the cheapest proofs are 2.4x cheaper than the ones the win test commits to (up to 9x in a
+  keeps its ordering unless these are set): a move that made cutoffs in one subtree usually still wins in
+  the next, but often with a much bigger proof than other winning moves. Half the nodes in the pilot's
+  units (the full-value solve too: 48.1 M → 22.3 M nodes on the benchmark).
+- **Proof-cost ordering at the root.** In the pilot's units, 10-32 of the eval's 40 best blue moves win,
+  and together the cheapest proofs are 2.4x cheaper than the ones the win test commits to (up to 9x in a
   unit). A move's proof is the sum over red's 200-500 replies, and the typical reply cost differs ~10x
   between moves where the eval sees no difference. So the eval's 8 best moves are screened: a sample of
   each move's replies, spread over the eval order, gets alpha-beta probes of 1000 nodes, and
@@ -162,19 +162,26 @@ from two changes:
   reply that is no blue win drops the move. The moves are then proved in the order of the estimate.
 
 Every answer comes from exact alpha-beta win tests, so budgets and samples only decide which proof is
-tried first. Win tests on 4 threads, fresh tables per unit (`BENCH_FRESH=1`), the three versions run
-interleaved three times on a busy machine (thread-seconds: median of the three):
+tried first. Nodes of the win tests (4 threads, fresh tables per unit with `BENCH_FRESH=1`; `PnSearch`
+with its default sample, and the range and mean over 5 samples, `PNS_SEED=0..4`), and thread-seconds of
+runs interleaved two or three times on a busy machine (mean):
 
-| win test | `bench/ply5_blue_wins.txt` nodes | thread-s | `bench/ply5_blue_wins_holdout.txt` nodes | thread-s |
+| set, 24 units each (`bench/`) | alpha-beta | probe ordering | `PnSearch` | thread-s |
 |---|---|---|---|---|
-| alpha-beta | 40.6 M | 82.6 | 42.9 M | 75.0 |
-| alpha-beta, ordering of the probes | 19.7 M | 44.9 | 21.6 M | 36.5 |
-| `PnSearch` (`BENCH_PNS=1`) | **12.8 M** (5 samples: 12.8-14.8, mean 13.9 M) | **32.7** | **11.8 M** (11.5-13.1, mean 12.3 M) | **23.9** |
+| `ply5_blue_wins.txt` (pilot) | 40.6 M | 19.7 M | **12.8 M** (12.8-14.8, mean 13.9) | 87.0 / 45.2 / 32.9 |
+| `ply5_blue_wins_holdout.txt` (pilot) | 42.9 M | 21.6 M | **11.8 M** (11.5-13.1, mean 12.3) | 77.2 / 41.1 / 25.4 |
+| `ply5_random_units.txt` | 50.1 M | **30.7 M** | 32.2 M (30.3-32.3, mean 31.5) | 89.0 / 65.9 / 61.3 |
+| `ply5_other_openings.txt` | 29.7 M | 29.0 M | **27.9 M** (25.3-27.9, mean 26.8) | 54.7 / 53.6 / 55.6 |
 
-The held-out set is 24 other red moves of the pilot (all blue wins, cost in the same range, fixed random
-draw), not used for any tuning. Per unit the sample matters (0.5-2x between `PNS_SEED` values), the
-totals less (±8 %). Screening costs up to ~0.1 M nodes per unit, so units that alpha-beta solves in a few
-thousand nodes get more expensive.
+The pilot sets are red's moves in the pilot position (the held-out set: 24 others in the benchmark's cost
+range, a fixed random draw, not used for tuning). The random units are drawn like the distributed solve's:
+a random red reply to `1:60 4B:16,27,28,39`, blue's answer from a 2 s search, a random red move. The other
+openings are blue wins from two earlier verification jobs (`results/jobs`). The screening pays off where
+many blue moves win with very different proof costs, as in the pilot (the cheapest winner among the eval's
+top 8 is 1.9x cheaper than the first); elsewhere fewer moves win, the cheap winners often rank below the
+top 8 (1.4x) and the screening is neutral (-3 % to +8 %). Per unit the sample matters (0.5-2x between
+seeds), and screening costs up to ~0.1 M nodes, which units that alpha-beta solves in a few thousand nodes
+feel.
 
 Tried and rejected (measured): classic best-first proof-number search over the first 2-3 plies, leaves
 initialised from the eval and typical costs and probed with doubling budgets (1.8-7x more nodes than
@@ -257,7 +264,8 @@ Other machines on the same network join with `snek worker <ip>:8090 <threads>` (
 - Solver v2 gives the same values as v1 on all benchmark positions.
 - `PnSearch` gives the solver's values (`SOLVER_PNS=1 snek solvebench …`, red bonus −1/0/1) on 1 608 random
   positions after 5–12 plies (screening from 8 pieces left at plies 6–7 and from 4 at plies 8–12
-  (`PNS_SCREEN_REM`), so that it runs at every level), and blue wins all 48 benchmark units.
+  (`PNS_SCREEN_REM`), so that it runs at every level), and agrees with the solver on the 96 units of the
+  four `bench/ply5_*` sets (all blue wins) with every sample seed.
 - `perft`: 1 → 91, 2 → 194 388, 3 → 315 706 848.
 
 ## Layout
