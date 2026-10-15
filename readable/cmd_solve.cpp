@@ -7,6 +7,7 @@
 #include "commands.hpp"
 #include "notation.hpp"
 #include "parallel_solve.hpp"
+#include "screened_win_test.hpp"
 
 static double secondsSince(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -93,16 +94,20 @@ static Position randomPosition(int plies, Rng& rng) {
 }
 
 // snek solvebench [plies] [count] [seconds] [threads]: exact solve of `count` random positions
-// after `plies` random moves (the same positions on every run).
+// after `plies` random moves (the same positions on every run). Env SOLVER_PNS=1: the values come
+// from two screened win tests (does the side to move win, and if not, does the opponent?).
 int cmdSolveBench(const Args& args) {
     int plies = args.arg(2, 10);
     int count = args.arg(3, 10);
     double seconds = args.arg(4, 60.0);
     int threads = args.arg(5, 1);
+    bool screened = envInt("SOLVER_PNS", 0) != 0;
     std::atomic<int> next{0};
     std::mutex printLock;
     auto worker = [&] {
-        Solver solver(21);
+        std::unique_ptr<ScreenedWinTest> winTest(screened ? new ScreenedWinTest(21) : nullptr);
+        std::unique_ptr<Solver> ownSolver(screened ? nullptr : new Solver(21));
+        Solver& solver = screened ? winTest->solver : *ownSolver;
         for (;;) {
             int i = next++;
             if (i >= count) break;
@@ -110,12 +115,13 @@ int cmdSolveBench(const Args& args) {
             Position pos = randomPosition(plies, rng);
             solver.clear();
             auto start = std::chrono::steady_clock::now();
-            int value = solver.solve(pos, seconds);
+            int value = screened ? winTest->value(pos, seconds) : solver.solve(pos, seconds);
+            uint64_t nodes = screened ? winTest->valueNodes : solver.nodes;
             double elapsed = secondsSince(start);
             std::lock_guard<std::mutex> lock(printLock);
             printf("plies=%d pos=%d value(stm)=%s nodes=%llu time=%.3fs knps=%.0f\n", plies, i,
-                   value == Solver::UNKNOWN ? "timeout" : std::to_string(value).c_str(), (unsigned long long)solver.nodes, elapsed,
-                   solver.nodes / elapsed / 1000);
+                   value == Solver::UNKNOWN ? "timeout" : std::to_string(value).c_str(), (unsigned long long)nodes, elapsed,
+                   nodes / elapsed / 1000);
             fflush(stdout);
         }
     };
@@ -157,7 +163,8 @@ static void printProfile(const Solver::Profile& p) {
 //                    exclusive time per ply and per step)
 //   BENCH_FRESH=1    every position starts from an empty table (node counts independent of the
 //                    order and the number of threads)
-//   BENCH_WINTEST=1  only whether the side to move wins (the window (0, 1))
+//   BENCH_WINTEST=1  only whether the side to move wins (the window (0, 1)); with BENCH_PNS=1 too,
+//                    by the screened win test (screened_win_test.hpp)
 //   SOLVER_TT=<n>    table size, log2 of the entries (22)
 int cmdBenchSet(const Args& args) {
     std::ifstream in(args.arg(2, ""));
@@ -177,11 +184,13 @@ int cmdBenchSet(const Args& args) {
     }
     bool fresh = envInt("BENCH_FRESH", 0) != 0;
     bool winTestOnly = envInt("BENCH_WINTEST", 0) != 0;
+    bool screened = winTestOnly && envInt("BENCH_PNS", 0) != 0;
     int tableLog2 = envInt("SOLVER_TT", 22);
 
     std::vector<int> value(positions.size());
     std::vector<uint64_t> nodes(positions.size());
     std::vector<double> seconds(positions.size());
+    std::vector<std::string> screenInfo(positions.size());  // probes and screens of the screened win test
     std::atomic<size_t> next{0};
     std::mutex profileLock;
     Solver::Profile total;
@@ -189,15 +198,25 @@ int cmdBenchSet(const Args& args) {
     std::shared_ptr<TranspositionTable> sharedTable = sharedLog2 ? std::make_shared<TranspositionTable>(sharedLog2 - 1) : nullptr;
     auto start = std::chrono::steady_clock::now();
     auto worker = [&] {
-        std::unique_ptr<Solver> ownSolver(sharedTable ? new Solver(sharedTable) : new Solver(tableLog2));
-        Solver& solver = *ownSolver;
+        std::unique_ptr<ScreenedWinTest> winTest(screened ? new ScreenedWinTest(tableLog2) : nullptr);
+        std::unique_ptr<Solver> ownSolver(screened ? nullptr : sharedTable ? new Solver(sharedTable) : new Solver(tableLog2));
+        Solver& solver = screened ? winTest->solver : *ownSolver;
         for (;;) {
             size_t i = next++;
             if (i >= positions.size()) break;
             if (fresh) solver.clear();
             auto positionStart = std::chrono::steady_clock::now();
-            value[i] = winTestOnly ? solver.solve(positions[i], 0, UINT64_MAX, 0, 1) : solver.solve(positions[i]);
-            nodes[i] = solver.nodes;
+            if (screened) {
+                value[i] = winTest->attackerWins(positions[i], positions[i].sideToMove);
+                nodes[i] = winTest->nodes();
+                char info[160];
+                snprintf(info, sizeof info, "  probes %llu  screens %llu", (unsigned long long)winTest->probes,
+                         (unsigned long long)winTest->screens);
+                screenInfo[i] = info;
+            } else {
+                value[i] = winTestOnly ? solver.solve(positions[i], 0, UINT64_MAX, 0, 1) : solver.solve(positions[i]);
+                nodes[i] = solver.nodes;
+            }
             {
                 std::lock_guard<std::mutex> lock(profileLock);
                 total.add(solver.profile);
@@ -214,7 +233,7 @@ int cmdBenchSet(const Args& args) {
     uint64_t totalNodes = 0;
     double threadSeconds = 0;
     for (size_t i = 0; i < positions.size(); i++) {
-        printf("%3zu  value %2d  %12llu nodes  %7.1fs\n", i, value[i], (unsigned long long)nodes[i], seconds[i]);
+        printf("%3zu  value %2d  %12llu nodes  %7.1fs%s\n", i, value[i], (unsigned long long)nodes[i], seconds[i], screenInfo[i].c_str());
         totalNodes += nodes[i];
         threadSeconds += seconds[i];
     }
