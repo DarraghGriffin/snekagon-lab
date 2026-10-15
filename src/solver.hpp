@@ -1,7 +1,10 @@
 // Exact solver: negamax alpha-beta over {-1, 0, +1} (loss/draw/win for the side
 // to move), transposition table keyed by the symmetry-canonical hash, snake-length
-// bounds for early cutoffs, TT-move + killer + history + learned-eval move ordering,
-// enhanced transposition cutoffs (ETC). The TT is lockless and can be shared by threads.
+// bounds for early cutoffs, threat zones, an exact closed form for the last pieces,
+// TT-move + killer + static + learned-eval move ordering, enhanced transposition cutoffs
+// (ETC). The TT is lockless and can be shared by threads.
+// There is no history heuristic: the scores it accumulated over a long solve outweighed
+// the static ordering (own snake first, blocks next) and cost about 30% more nodes.
 #pragma once
 #include <atomic>
 #include <chrono>
@@ -56,7 +59,6 @@ inline const char* PART_NAMES[NPART] = {"tt", "lastPieces", "bounds", "killerThr
 
 struct Solver {
     std::shared_ptr<LTT> tt;
-    std::vector<int32_t> hist[2];
     int16_t killer[32][2];
     uint64_t nodes = 0;
     std::atomic<bool>* stop = nullptr;
@@ -86,12 +88,10 @@ struct Solver {
     static constexpr int FULL_SORT_AFTER = 3;
     void init() {
         for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); scBuf[i].resize(3000); sortBuf[i].resize(3000); }
-        for (auto& h : hist) h.assign(T.NGID, 0);
         std::memset(killer, -1, sizeof killer);
     }
     void clear() {
         tt->clear();
-        for (auto& h : hist) std::fill(h.begin(), h.end(), 0);
         std::memset(killer, -1, sizeof killer);
     }
 
@@ -331,7 +331,6 @@ struct Solver {
         BB oppFront = expand(shapeOf(opp).ends) & s.empty();
         int ply = std::min<int>(s.ply, 31);
         int k1 = killer[ply][0], k2 = killer[ply][1];
-        auto& H = hist[s.stm];
         // threats: the opponent's refutations one ply down are the natural candidates
         Threat threats[MAX_THREATS];
         int nThreats = 0, tried[MAX_TRIED], nTried = 0;
@@ -351,7 +350,7 @@ struct Solver {
                 int tb = threatBound(pl.m, threats, nThreats);
                 if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; return; }
             }
-            int sc = H[m.gid] + PIECE_CELLS[m.piece()] * 64;
+            int sc = PIECE_CELLS[m.piece()] * 64;
             if (pl.nb & me) sc += 256;
             if (pl.m & oppFront) sc += 128;
             else if (pl.nb & opp) sc += 32;
@@ -412,7 +411,6 @@ struct Solver {
                 if (v > best) { best = v; bestGid = moves[i].gid; }
                 if (v > alpha) alpha = v;
                 if (alpha >= beta) {
-                    H[moves[i].gid] += 1 + i / 8 + 4 * s.ply;
                     if (killer[ply][0] != moves[i].gid) { killer[ply][1] = killer[ply][0]; killer[ply][0] = moves[i].gid; }
                     break;
                 }
