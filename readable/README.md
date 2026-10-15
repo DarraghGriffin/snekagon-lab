@@ -23,22 +23,24 @@ which `tools/fit_eval.py` writes.
 | 1 | `board.hpp` | Hex coordinates, the 128-bit `Bitboard`, neighbours by shifting, flood fill, the 12 symmetries |
 | 2 | `pieces.hpp` | The 8 pieces, their orientations, all placements (numbered once at start-up), `Move` |
 | 3 | `position.hpp` | `Position`, `play()`, snakes kept up to date incrementally, Zobrist hashing, symmetric keys |
-| 4 | `rules.hpp` | The placement rules: a plain rule check and the fast bit-parallel move generator |
-| 5 | `bounds.hpp` | Sound lower and upper bounds on each player's final longest snake |
+| 4 | `rules.hpp` | The placement rules: a plain rule check (for either player) and the fast bit-parallel move generator |
+| 5 | `bounds.hpp` | Sound lower and upper bounds on each player's final longest snake, and the clusters behind them |
 | 6 | `features.hpp` | Territory split ("who gets where first") and per-player features |
 | 7 | `evaluation.hpp` | Learned evaluation (logistic regression over 14 features) and the old hand-made one |
 | 8 | `transposition_table.hpp` | Lockless two-slot hash table of the exact solver |
-| 9 | `solver.hpp` | **Exact solver**: alpha-beta over {-1, 0, +1}, split into steps (table, bounds, ordering, search, store) |
-| 10 | `parallel_solve.hpp` | Exact solve of a position with its root moves spread over threads |
-| 11 | `engine.hpp` | **Playing engine**: iterative-deepening PVS with forward pruning, multi-PV, score smoothing |
-| 12 | `analysis.hpp` | "Analyse this position" for the UI: exact when few pieces are left, otherwise the engine |
-| 13 | `mcts.hpp` | The first engine (Monte-Carlo tree search), kept for comparison |
-| 14 | `notation.hpp`, `training_data.hpp` | Moves and positions as text; CSV rows for training the evaluation |
-| 15 | `main.cpp`, `commands.hpp` | Table of all commands with their arguments |
-| 16 | `cmd_*.cpp` | One file per group of commands: `serve` (UI protocol), `solve` (solvepos, solvebench, benchset), `check` (perft, verify, info, speed), `data` (gendata, refeature, evalexplain, evaltrace), `play` (arena, selfplay), `worker` (distributed solving) |
+| 9 | `solver.hpp` | **Exact solver**: alpha-beta over {-1, 0, +1} with a window, threat zones and the last pieces valued without a search, split into steps (table, last pieces, bounds, threats, ordering, search, store) |
+| 10 | `parallel_solve.hpp` | Exact solve of a position, or a yes/no question about it, with its root moves spread over threads |
+| 11 | `screened_win_test.hpp` | Win test that looks for cheap proofs first: the best moves are screened by small probes of their replies |
+| 12 | `engine.hpp` | **Playing engine**: iterative-deepening PVS with forward pruning, multi-PV, score smoothing; in `ab2` also exact verdicts on the root moves |
+| 13 | `analysis.hpp` | "Analyse this position" for the UI: exact when few pieces are left, otherwise the engine |
+| 14 | `mcts.hpp` | The first engine (Monte-Carlo tree search), kept for comparison |
+| 15 | `notation.hpp`, `training_data.hpp` | Moves and positions as text; CSV rows for training the evaluation |
+| 16 | `main.cpp`, `commands.hpp` | Table of all commands with their arguments |
+| 17 | `cmd_*.cpp` | One file per group of commands: `serve` (UI protocol), `solve` (solvepos, solvebench, benchset), `refute` (the side to move cannot win), `check` (perft, verify, info, speed), `data` (gendata, refeature, evalexplain, evaltrace), `play` (arena, selfplay), `worker` (distributed solving) |
 
-To see how a position gets solved, read `rules.hpp`, then `bounds.hpp`, then `solver.hpp`. To see where
-the engine's move comes from, read `evaluation.hpp`, then `engine.hpp`, then `analysis.hpp`.
+To see how a position gets solved, read `rules.hpp`, then `bounds.hpp`, then `solver.hpp`, and
+`screened_win_test.hpp` for the win test that picks cheap proofs. To see where the engine's move comes
+from, read `evaluation.hpp`, then `engine.hpp`, then `analysis.hpp`.
 
 ## Names: original to readable
 
@@ -58,20 +60,36 @@ the engine's move comes from, read `evaluation.hpp`, then `engine.hpp`, then `an
 | `GenCtx`, `orientLegal` | `MoveGenContext`, `legalAnchors` |
 | `Orient` (`ideg`, `tri`, `two`, `gidAt`) | `Orientation` (`innerNeighbours`, `wedgeCells`, `bridgeCells`, `placementAt`) |
 | `s.genMoves`, `s.hasMove`, `s.legal`, `s.legalMove` | `generateMoves`, `hasLegalMove`, `isLegalPlacement`, `isLegalMove` |
+| `s.legalFor(c, pl)`, `s.forEachLegalTouching(cells, f)` | `isLegalPlacementFor(pos, player, p)`, `forEachLegalMoveCovering(pos, cells, f)` |
 | `snakeBounds(s, c, lb, ub)` | `SnakeBounds snakeBounds(pos, player)` with `.lower`, `.upper` |
+| `Clusters` (`n`, `ub`, `region`), `snakeClusters`, `clusterBound` | `SnakeClusters` (`count`, `upper`, `regions`), `snakeBounds(pos, player, &clusters)`, `clusterUpperBound` |
+| `growable`, `boundAfterBlock`, `lengthAfter` | `growableCells`, `upperBoundAfterBlock`, `longestSnakeAfter` |
 | `voronoi`, `PlayerFeat`, `features` | `splitTerritory`, `PlayerFeatures`, `computeFeatures` |
 | `EW`, `EHEAD`, `g_evalSet`, `g_handEval`, `evaluateHand` | `featureWeights`, `featureHeadStart`, `activeWeightSet`, `useHandMadeEval`, `evaluateHandMade` |
 | `LTT` | `TranspositionTable` |
 | `Solver::terminalValue`, `finalScore` | `gameResult`, `redLead` |
-| `AbSearcher::ab`, `exactKnown`, `AP` | `AlphaBetaSearcher::search`, `exactScore`, `engineParams` |
-| `abAnalyze`, `RootResult`, `AbAnalysis` | `analyzeWithEngine`, `RootMoveResult`, `EngineAnalysis` |
+| `Threat`, `addThreat`, `scanThreats`, `threatBound` | `Threat`, `ThreatList::tryPlacement`, `ThreatList::scan`, `ThreatList::boundFor` |
+| `lastPieces` (`-2`: not the last pieces) | `lastPiecesValue` (`false`) |
+| `pPruned`, `pMoves`, `pLast`, `pScans`, `pScanHits` | `profile.threatSkipped`, `.movesListed`, `.lastPieces`, `.threatScans`, `.threatScansFound` |
+| `PART_*`, `PlyTimer`, `TIMED` (`-DSOLVER_TIMING`) | `Solver::Step`, `NodeTimer`, `timed()` |
+| `ab.search` + `nodeLimit` / `useDeadline` (as `PnSearch` and `solveWindow` use them) | `Solver::searchWithin`, `setTimeLimit`, `setDeadline`, `pastDeadline` |
+| `ParallelSolveResult`, `SolveQuestion` | `RootSolveResult`, `SolveQuestion` (an `enum class`) |
+| `PnSearch` (`pns.hpp`), `ab`, `solveWin`, `solveValue`, `totalNodes` | `ScreenedWinTest` (`screened_win_test.hpp`), `solver`, `attackerWins`, `value`, `valueNodes` |
+| `solveOr`, `solveAnd`, `moves`, `full`, `sampleOrder`, `scaled`, `pnNodes` | `someMoveWins`, `everyReplyLoses`, `unrefutedMoves`, `fullTest`, `spreadSampleOrder`, `budgetFor`, `orderingNodes` |
+| `AbSearcher::ab`, `exactKnown`, `P` | `AlphaBetaSearcher::search`, `exactScore`, `params` |
+| `AbParams`, `abParamsV2()` | `EngineParams`, `engineParamsV2()` |
+| `AbEngine` (`pool`, `exactTT`, `exactPool`), `abEngine(version)` | `EngineVersion` (`searchers`, `verdictTable`, `verdictSolvers`), `engineVersion(version)` |
+| `abAnalyze`, `RootResult`, `AbAnalysis`, `rootMovesByEval` | `analyzeWithEngine`, `RootMoveResult`, `EngineAnalysis`, `scoreRootMovesAtDepth1` |
+| `solveWindow`, `exactVerdicts`, `rankByVerdict` | `solveWithin`, `exactVerdicts`, `rankByVerdict` |
+| `analyzeAb`, `g_engine` | `analyzeAlphaBeta`, `DEFAULT_ENGINE` / `ServedGame::engine` |
 | `terminalScore` | `finishedGameScore` |
 | `uniqueRootMoves` | `symmetryUniqueMoves` |
 | `moveStr`, `posStr`, `parsePosStr` | `moveToString`, `positionToString`, `parsePosition` |
 | `-9` | `Solver::UNKNOWN` |
 
 The feature names of the learned evaluation (`dL`, `dSingle`, ...) and the CSV column names stay as they
-are, because weight files and `tools/fit_eval.py` use them.
+are, because weight files and `tools/fit_eval.py` use them. So do the environment variables
+(`SOLVER_*`, `BENCH_*`, `PNS_*`, `REFUTE_*`) and the step names of the timing profile.
 
 ## What must not change (or results change)
 
@@ -81,38 +99,50 @@ Some details look arbitrary but decide the exact node counts, the move order and
   anchor cells ascending. The move generator returns moves in this order.
 - **Zobrist keys**: seed `0x5eca9011`, generated in the order red cells, red pieces, blue cells, blue
   pieces, side to move. Symmetric hashes are kept only up to ply 6 (`SYMMETRY_PLY`).
-- **Move ordering**: all scores (history, killers, `+256` / `+128` / `+32` bonuses, evaluation × 1000),
-  the selection sort that keeps the earlier move on ties, and `std::sort` (not stable) on the same
-  input arrays.
+- **Move ordering**: all scores (killers, `+256` / `+128` / `+32` bonuses, evaluation × 1000; the
+  engine's history), the selection sort of the solver's first three moves that keeps the earlier move
+  on ties, the one sort of the rest by score and then placement id, and `std::sort` (not stable) on
+  the same input arrays (also the threats by zone size and the last pieces' replies).
+- **Threat lists**: at most 6 threats per node, 8 placements tried one by one, 64 found per scan; the
+  killers of the next ply are tried before the moves are generated.
 - **Transposition-table layout** and its replacement rule.
-- **Floating point**: the logit is summed in feature order; `(int)(1000 * logit)` truncates and
-  `lround(100 * z)` rounds, as before.
+- **Floating point**: the logit is summed in feature order, and `learnedLogit` stays out of line, so
+  that every caller gets the same rounding (inlined, the compiler fuses the multiply-adds in some
+  callers and not in others); `(int)(1000 * logit)` truncates and `lround(100 * z)` rounds, as before.
 - **Output formats**: JSON for the UI, CSV for training data, the worker protocol, the `solvepos`
-  progress lines.
+  progress lines, the `refute` log.
 
 ## Differences from `src/`
 
 - An unknown command prints the list of commands (`src/` silently exits).
 - Missing required arguments of `solvepos` and `evaltrace` fall back to defaults instead of crashing.
+- `verify` compares the bounds with a reference that applies the k + 1 snakes rule as well. The
+  reference in `src/` does not, so `src/`'s `verify` reports a `BOUNDS MISMATCH` (game 2, ply 12) where
+  the fast bound is tighter; with the rule added to its reference it prints the same as here.
 
 ## Verification
 
-Both builds (`build/snek_orig.exe` from `src/`, `build/snek_readable.exe` from here) were run on the
-same inputs and the outputs compared with timings removed. All were identical:
+Both builds (`build/snek_orig.exe` from `src/`, `build/snek_readable.exe` from here, the commands
+above) were run on the same inputs and the outputs compared with timings removed. All were identical:
 
 | Check | What it covers |
 |-------|----------------|
 | `perft 3` | 91 / 194 388 / 315 706 848: move generation |
-| `verify 2000` | 31 391 positions: fast generator vs rule check, fast vs reference bounds, bounds vs final results |
-| `info` | placement counts |
-| `solvebench 8 6`, `solvebench 10 10` (1 thread) | values and node counts of the exact solver |
-| `benchset` (6 ply-5 positions, `PROFILE=1`) | 25 137 794 nodes, identical per-ply statistics |
-| `solvepos` at ply 6 (1 and 8 threads), with `PROGRESS` log and resume | all 408 root-move results (red loses) |
-| `serve`: state, set, play, undo, children, engine, analyze, go, solve, errors | UI protocol |
-| `gendata` (normal and `good` mode, 1 thread) | training rows: features, exact values, hand evaluation |
-| `refeature`, `evalexplain`, `evaltrace 3` | features, learned evaluation, fixed-depth engine search |
-| `worker` against a local test coordinator | protocol, node budgets, invalid units |
-| `speed` | same checksums of the hot functions; speed equal within noise |
+| `verify 2000`, `verify 3000` | 31 391 / 47 131 positions: fast generator vs rule check, fast vs reference bounds, bounds vs final results (`src/` with the k + 1 rule in its reference, see above) |
+| `info`, `speed` | placement counts; the checksums of the hot functions |
+| `solvebench` 8 6, 10 10, 7 12, 6 12 and 5 3 (1 thread) | values and node counts of the exact solver; also with `SOLVER_PNS=1`, `SOLVER_RED_BONUS=±1`, `SOLVER_THREATS=0`, `SOLVER_THREAT_SCAN=0 SOLVER_LAST=0 SOLVER_KILLERS_OVER_EVAL=0` and `SOLVER_ETC_REM=8` |
+| `BENCH_FRESH=1 PROFILE=1 benchset` on the four `bench/ply5_*` sets (1 thread) | exact values, `BENCH_WINTEST=1` and `BENCH_WINTEST=1 BENCH_PNS=1`: node counts per position, per-ply statistics, probes and screens. On `ply5_blue_wins.txt` 28 568 903, 25 417 308 and 12 768 835 nodes |
+| the same with `-DSOLVER_TIMING` | node counts and statistics; the timing table has the same rows and steps |
+| `solvepos` at plies 6 and 7 (1 thread), also with `SOLVER_WIN_TEST=1`, a `PROGRESS` log and its resume | root-move results and node counts |
+| `refute 1 <log> 1:60 4B:16,27,28,39 3V:40,41,50 4A:62,72,82,93 4A:58,59,68,78 3V:31,42,52 4I:7,8,9,10`, resumed, with `REFUTE_LOSS=1` and with small `REFUTE_CHUNK` / `REFUTE_TRIES` / `REFUTE_NODES` (both passes) | output and log: every refutation, open move and survivor |
+| `serve 1`: state, set, play, undo, children, engine, analyze and go (`ab` and `ab2`, where their answer does not depend on time), solve, errors, `SERVE_PROGRESS=1` | UI protocol |
+| `gendata` (normal and `good` mode, 1 thread), `refeature`, `evalexplain`, `evaltrace 3` | training rows; features, learned evaluation, fixed-depth search of `ab` |
+| fixed-depth `analyzeWithEngine` / `abAnalyze` of `ab` and `ab2` on two games (1 thread, multi-PV 1 and 8, depths 1-4), from a small test program calling them | depth, scores, displayed scores, verdicts and nodes of every root move |
+| `worker` against a local test coordinator, also with `SOLVER_WIN_TEST=1` | protocol, values and nodes, node budgets, invalid units |
 
-Timing-dependent commands (`arena`, `selfplay`, MCTS) cannot be compared output to output. They run, and
-their results are the same within normal variation.
+With several threads the order of the work depends on timing, so those runs were compared by their
+results: `solvepos` with 4 threads (exact, and `SOLVER_WIN_TEST=1` at ply 5), `refute 2` (the same
+verdict for every move) and `benchset` with 4 threads (the same values). Timing-dependent commands
+(`arena`, `selfplay`, MCTS) cannot be compared output to output. They run, and their results are the
+same within normal variation. Single-thread `benchset` times of the two builds, run in turns, are
+within noise of each other.
