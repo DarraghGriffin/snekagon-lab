@@ -131,6 +131,7 @@ Positions from **good play** (`snek solvepos`, engine self-play game in `results
 | `1:60 4B:16,27,28,39 3V:40,41,50` (the reply that resisted 40 candidates and 282 thread-hours) | **blue wins** with `3V:9,20,21`, a move the evaluation ranks 923rd of 1032. All 1039 red replies are blue wins, by win tests in 0.65 thread-hours (`results/stubborn_3V9_wintest.log`) and again with exact values by the v3 solver of commit ed2c6b1 (`results/stubborn_3V9_ply4.*`, 10.8 thread-hours). Every other blue move is refuted by a red reply after which blue does not win (`results/stubborn_refute.log`, from the experimental sweep that became `snek refute`; all 1031 refutations re-run as fresh win tests, none a blue win, `results/stubborn_refute_wintest.log`; 60 of them drawn at random, re-solved by the v3 solver: 48 blue losses, 12 draws, `results/stubborn_refute_sample_v3.log`), so `3V:9,20,21` is blue's only winning move here |
 | `1:60 4B:16,27,28,39 4C:40,41,50,52` (red's U-block: grows from the centre and wraps the head of blue's snake) | **blue cannot win**: each of blue's 938 moves is refuted by a red reply after which blue does not win (`results/hold_4C40_refute.log`, the `snek proveline` sweep), and the v3 solver of commit ed2c6b1 confirms every one with exact values: 824 blue losses, 114 draws (`results/hold_4C40_refute_v3.log`). So blue's `4B:16,27,28,39` does **not** win against the centre. Blue holds the draw with `4A:49,59,70,81` (`REFUTE_LOSS=1` sweep, `results/hold_4C40_draw_refute.log`; the v3 solver gives value 0 after it: of red's 635 replies 633 lose and 2 draw, `results/hold_4C40_4A49_ply4.*`), so this position is a **draw** |
 | `1:60 4A:51,52,63,74 3V:29,40,50` (blue's third choice against the centre by the engine, then red's 17th reply in the evaluation's order) | **blue cannot win**: each of blue's 867 moves is refuted (`results/hold_4A51_3V29_refute.log`), every one confirmed with exact values by the v3 solver: 802 blue losses, 65 draws (`results/hold_4A51_3V29_refute_v3.log`). So blue's `4A:51,52,63,74` does **not** win against the centre either. Blue holds the draw with `4C:59,61,70,71` (`results/hold_4A51_3V29_draw_refute.log`; the v3 solver gives value 0 after it, `results/hold_4A51_3V29_4C59_ply4.*`), so this position is a **draw**; red's first 16 replies are blue wins (`results/centre_4A51_proveline.txt`) |
+| `1:60 3V:36,37,48 4A:58,59,68,78` (blue's second choice against the centre by the engine, then red's 20th reply in the evaluation's order) | **blue cannot win**: each of blue's 1004 moves is refuted (`results/hold_3V36_4A58_refute.log`); 661 of these refutations, taken in random order, re-solved by the v3 solver: 595 blue losses, 66 draws, none a blue win; the rest are not re-solved (`results/hold_3V36_4A58_refute_v3.log`). So blue's `3V:36,37,48` does **not** win against the centre either. Blue holds the draw with `4C:49,50,61,71` (`results/hold_3V36_4A58_draw_refute.log`; the v3 solver gives value 0 after it: 652 of red's 653 replies lose and one draws, `results/hold_3V36_4A58_4C49_ply4.*`), so this position is a **draw**; red's first 19 replies are blue wins (`results/centre_3V36_proveline.txt`) |
 | `1:60 4B:16,27,28,39` and 40 of red's replies | each **blue wins** (`results/centre_4B_proveline.txt`, the `snek proveline` summary: red's replies in the evaluation's order, the winning answer of each; red's 30th reply in that order is the U-block above) |
 | `1:60 4B:16,27,28,39 3V:93,94,103` | **blue wins** with `4A:49,59,70,81` (670 red replies, `results/reply_3V93_4A49_wintest.log`); the 6 best blue moves by a 3 s search do not win |
 | `1:60 4B:16,27,28,39 4I:102,103,104,105` | **blue wins** with `4C:64,75,84,85`, about the 440th of 872 blue moves in the evaluation's order (`results/reply_4I102_refute.log`) |
@@ -247,7 +248,8 @@ The work comes in two kinds of steps, both measured on this laptop (Ryzen 7 250,
   order (the stubborn `3V:40,41,50`: about 5 thread-hours).
 - **Showing that blue cannot win a line**: one red reply after which every blue answer is refuted. For
   `4B:16,27,28,39` that was red's 30th reply in the evaluation's order, `4C:40,41,50,52` (938 refutations,
-  about 2.5 thread-hours); the whole run took about 13 thread-hours.
+  about 2.5 thread-hours); the whole run took about 13 thread-hours. Against `4A:51,52,63,74` and
+  `3V:36,37,48` the hold was red's 17th and 20th reply (the latter run about 20 thread-hours).
 
 With every opening's lines at 608-1589 red replies after blue's preferred reply (15 259 in all):
 
@@ -257,10 +259,12 @@ With every opening's lines at 608-1589 red replies after blue's preferred reply 
 | engine's chance for blue | 75 % | 77 % | 71 % | 63 % | 67 % | 61 % | 62 % | 70 % | 71 % | 83 % | 78 % | 59 % |
 
 - A proof that blue wins the game (one winning blue reply per opening, every red reply settled) would be
-  about 15 259 × 0.33-1.5 ≈ **0.5-2.3·10⁴ thread-hours**. The centre makes that unlikely: blue's best reply by
-  the engine, `4B:16,27,28,39`, only draws, and the engine rates every other reply at 50 % or less.
+  about 15 259 × 0.33-1.5 ≈ **0.5-2.3·10⁴ thread-hours**. The centre makes that unlikely: blue's three best
+  replies by the engine (`4B:16,27,28,39`, `3V:36,37,48`, `4A:51,52,63,74`) do not win, and the engine rates
+  every other reply at 50 % or less.
 - Showing that the centre is not a blue win means one holding red reply for each of blue's 172 distinct
-  replies: at about 13 thread-hours each, **about 2·10³ thread-hours**, less where red's hold comes early.
+  replies (three are done): at about 13 thread-hours each, **about 2·10³ thread-hours**, less where red's hold
+  comes early.
 - If the game is a draw, the proof is that, plus a drawing blue reply to each opening with every red reply
   answered by a blue move that does not lose (about 15 259 × 0.33 ≈ 5·10³): **about 10⁴ thread-hours**, a few
   weeks of one 16-thread laptop or under a day on 1000 cores.
