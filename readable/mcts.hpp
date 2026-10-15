@@ -143,9 +143,13 @@ inline std::vector<MoveStats> analyzeWithMcts(const Position& root, double secon
     std::vector<std::unique_ptr<MctsTree>> trees;
     for (int i = 0; i < threads; i++)
         trees.emplace_back(new MctsTree(0x1234 + i * 7919 + (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count()));
-    std::vector<std::thread> pool;
-    for (int i = 0; i < threads; i++) pool.emplace_back([&, i] { trees[i]->run(root, seconds, stop); });
-    for (auto& t : pool) t.join();
+    if (threads == 1) {
+        trees[0]->run(root, seconds, stop);  // on this thread, so it also runs where there are no threads (the WebAssembly build of src/)
+    } else {
+        std::vector<std::thread> pool;
+        for (int i = 0; i < threads; i++) pool.emplace_back([&, i] { trees[i]->run(root, seconds, stop); });
+        for (auto& t : pool) t.join();
+    }
 
     std::map<int, MoveStats> total;  // by placement id
     for (auto& tree : trees) {
