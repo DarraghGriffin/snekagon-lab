@@ -66,7 +66,7 @@ struct Solver {
     uint64_t nodeLimit = UINT64_MAX;
     // profiling counters per ply: visited, cut by TT, cut by bounds, expanded
     uint64_t pVisit[16] = {}, pTT[16] = {}, pBound[16] = {}, pExp[16] = {};
-    uint64_t pPruned[16] = {}, pMoves[16] = {}, pLast[16] = {};  // ... / nodes solved by lastPieces  // moves skipped by threat zones / moves generated, per ply
+    uint64_t pPruned[16] = {}, pMoves[16] = {}, pLast[16] = {}, pScans[16] = {}, pScanHits[16] = {};  // ... / nodes solved by lastPieces  // moves skipped by threat zones / moves generated, per ply
     bool useThreats = envInt("SOLVER_THREATS", 1) != 0;
     bool useLastPieces = envInt("SOLVER_LAST", 1) != 0;
     bool threatScan = envInt("SOLVER_THREAT_SCAN", 1) != 0;
@@ -145,10 +145,15 @@ struct Solver {
     // bound exceeds the opponent's length after the placement must be covered by it.
     // Keeps the smallest zones (a zone containing a kept one prunes nothing more).
     static void scanThreats(const Pos& s, int alpha, int bonus, Threat* threats, int& n) {
-        int me = s.stm, opp = me ^ 1;
         Clusters cl;
         int lbMe, ubMe;
-        snakeClusters(s, me, lbMe, ubMe, cl);
+        snakeClusters(s, s.stm, lbMe, ubMe, cl);
+        scanThreats(s, cl, alpha, bonus, threats, n);
+    }
+    // cl: our clusters (snakeClusters of the side to move)
+    static void scanThreats(const Pos& s, const Clusters& cl, int alpha, int bonus, Threat* threats, int& n) {
+        int me = s.stm, opp = me ^ 1;
+        int lbMe = s.L[me];
         int strict = alpha < 0 ? 1 : 0;  // a loss needs our bound strictly below the opponent
         // a placement joins at most two snakes (it is one segment of a path), which caps what
         // the opponent can reach, and every cluster above that cap must be covered
@@ -299,7 +304,9 @@ struct Solver {
         }
         // snake-length bound cutoffs
         int lbMe, ubMe, lbOp, ubOp;
-        TIMED(PART_BOUNDS, snakeBounds(s, s.stm, lbMe, ubMe); snakeBounds(s, s.stm ^ 1, lbOp, ubOp));
+        Clusters myClusters;  // kept for the threat scan
+        TIMED(PART_BOUNDS, if (useThreats) snakeClusters(s, s.stm, lbMe, ubMe, myClusters); else snakeBounds(s, s.stm, lbMe, ubMe);
+                           snakeBounds(s, s.stm ^ 1, lbOp, ubOp));
         int bonus = s.stm == 0 ? RED_BONUS : -RED_BONUS;  // the side to move's share of SOLVER_RED_BONUS
         lbMe += bonus;
         ubMe += bonus;
@@ -414,7 +421,13 @@ struct Solver {
                 // look for all the opponent's threats
                 if (threatsOn && i + 2 < n) {
                     addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
-                    if (!scanned) { scanned = true; TIMED(PART_SCAN, scanThreats(s, alpha, bonus, threats, nThreats)); }
+                    if (!scanned) {
+                        scanned = true;
+                        int before = nThreats;
+                        TIMED(PART_SCAN, scanThreats(s, myClusters, alpha, bonus, threats, nThreats));
+                        pScans[pp]++;
+                        if (nThreats > before) pScanHits[pp]++;
+                    }
                 }
             }
             best = std::max(best, skipped);

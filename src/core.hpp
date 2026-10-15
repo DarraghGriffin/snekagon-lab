@@ -513,15 +513,16 @@ inline int pieceCount(uint8_t av) { return __builtin_popcount(av); }
 //    it contains at most k + 1 old snakes: only the k + 1 longest of the cluster count.
 // The clusters themselves (cells and per-cluster upper bound), for threat detection.
 struct Clusters {
-    int n = 0;
-    BB cells[NCELLS];  // growable cells and own snakes of the cluster
-    int ub[NCELLS];    // upper bound of a final snake inside the cluster
+    int n = 0, nRegions = 0;
+    BB cells[NCELLS];    // growable cells and own snakes of the cluster
+    int ub[NCELLS];      // upper bound of a final snake inside the cluster
+    BB region[NCELLS];   // the connected regions of growable cells (of all clusters)
 };
 // Upper bound (at least lb) of the final snake of a player with pieces av, snakes comps and
 // growable cells G, cluster by cluster as described above.
 template <bool Record>
 inline int clusterBound(BB G, const BB* comps, int ncomp, uint8_t av, int lb, Clusters* out) {
-    if (Record) out->n = 0;
+    if (Record) out->n = out->nRegions = 0;
     // clusters = growable regions joined through the snakes touching them. Regions are
     // compact blobs (cheap floods); snakes are attached by adjacency, never flooded.
     BB cl[NCELLS];
@@ -531,6 +532,7 @@ inline int clusterBound(BB G, const BB* comps, int ncomp, uint8_t av, int lb, Cl
         BB r = flood(bit(lsb(g)), g);
         g &= ~r;
         cl[n] = r; own[n] = 0; cap[n] = T.fit[av][popc(r)]; n++;
+        if (Record) out->region[out->nRegions++] = r;
     }
     for (int j = 0; j < ncomp; j++) {
         BB cm = comps[j], nb = expand(cm);
@@ -581,15 +583,30 @@ inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) { snakeBoundsImpl
 inline void snakeClusters(const Pos& s, int c, int& lb, int& ub, Clusters& out) { snakeBoundsImpl<true>(s, c, lb, ub, &out); }
 // Upper bound of player c after cells m (empty now) are taken by the opponent, given c's
 // clusters: only the clusters that m covers change, and only those are recomputed.
+// A connected placement m lies in one region; when the region stays connected without m
+// (the cells next to m are still connected within distance 2 of m), every snake keeps
+// touching it and the region still holds as many piece cells, the cluster bound is unchanged.
 inline int boundAfterBlock(const Pos& s, int c, const Clusters& cl, int lb, BB m) {
     int ub = lb;
+    uint8_t av = s.avail[c];
     for (int i = 0; i < cl.n; i++) {
         if (!(cl.cells[i] & m)) { ub = std::max(ub, cl.ub[i]); continue; }
+        BB rest = cl.cells[i] & ~s.own[c] & ~m;
         BB comps[8];
         int nc = 0;
         for (int j = 0; j < s.ncomp[c]; j++)
             if (cl.cells[i] & s.comp[c][j]) comps[nc++] = s.comp[c][j];
-        ub = std::max(ub, clusterBound<false>(cl.cells[i] & ~s.own[c] & ~m, comps, nc, s.avail[c], lb, nullptr));
+        BB r = 0, mg = m & cl.cells[i] & ~s.own[c];  // the blocked growable cells
+        for (int k = 0; k < cl.nRegions; k++) if (cl.region[k] & mg) { r = cl.region[k]; break; }
+        BB after = r & ~m, near = expand(m) & after;
+        bool unchanged = near && !(mg & ~r) && T.fit[av][popc(after)] == T.fit[av][popc(r)];
+        if (unchanged) {
+            BB around = flood(bit(lsb(near)), expand(expand(m)) & after);
+            unchanged = !(near & ~around);
+            for (int j = 0; j < nc && unchanged; j++)
+                if ((expand(comps[j]) & r) && !(expand(comps[j]) & after)) unchanged = false;
+        }
+        ub = std::max(ub, unchanged ? cl.ub[i] : clusterBound<false>(rest, comps, nc, av, lb, nullptr));
     }
     return ub;
 }
