@@ -380,7 +380,8 @@ int main(int argc, char** argv) {
         // that wins against all defender replies after it, or proof that the attacker cannot win after
         // that reply. Answers that won against earlier replies are tried first (the same answer often
         // wins again). The defender's best replies by the evaluation come first, so a reply that breaks
-        // the line shows up early. dir/summary.txt gets one line per reply ("<reply> wins <answer>" or
+        // the line shows up early; it stops there (the attacker does not win the line) unless
+        // PROVELINE_ALL=1. dir/summary.txt gets one line per reply ("<reply> wins <answer>" or
         // "<reply> holds"); dir/<reply>.log are the sweeps' resumable logs; a rerun continues.
         if (argc < 5) { printf("usage: snek proveline <threads> <dir> <moves...>\n"); return 1; }
         if (envInt("REFUTE_LOSS", 0)) { printf("proveline proves wins; REFUTE_LOSS is for refute only\n"); return 1; }
@@ -418,7 +419,9 @@ int main(int argc, char** argv) {
         }
         std::stable_sort(replies.begin(), replies.end(), [](auto& a, auto& b) { return a.first > b.first; });
         size_t won = 0, held = 0;
+        bool all = envInt("PROVELINE_ALL", 0) != 0;
         for (auto& [sc, m] : replies) {
+            if (held && !all) break;  // one reply that holds settles the line
             std::string ms = moveStr(m);
             if (done.count(ms)) { won += done[ms] == "wins"; held += done[ms] == "holds"; continue; }
             Pos a = s; a.play(m);
@@ -445,6 +448,8 @@ int main(int argc, char** argv) {
         }
         printf("%zu replies: %zu with a winning answer, %zu where the attacker cannot win, %zu open\n", replies.size(), won, held,
                replies.size() - won - held);
+        if (held) printf("the attacker does not win this line\n");
+        else if (won == replies.size()) printf("the attacker WINS this line\n");
     } else if (mode == "worker") {
         // snek worker <host[:port]> [threads] [name]
         if (argc < 3) { printf("usage: snek worker <coordinator-ip[:port]> [threads] [name]\n"); return 1; }

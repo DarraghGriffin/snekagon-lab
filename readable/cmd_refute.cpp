@@ -58,7 +58,8 @@ int cmdRefute(const Args& args) {
 // sweep for the opponent (the attacker): an attacker answer that wins against all defender replies
 // after it, or proof that the attacker cannot win after that reply. Answers that won against
 // earlier replies are tried first (the same answer often wins again). The defender's best replies
-// by the evaluation come first, so a reply that breaks the line shows up early.
+// by the evaluation come first, so a reply that breaks the line shows up early; one such reply
+// settles the line, and the command stops there unless PROVELINE_ALL=1.
 //
 // dir/summary.txt gets a line per settled reply, and a rerun continues after them:
 //   <reply> wins <answer> <seconds>
@@ -111,7 +112,9 @@ int cmdProveLine(const Args& args) {
     std::stable_sort(replies.begin(), replies.end(), [](auto& a, auto& b) { return a.first > b.first; });
 
     size_t won = 0, held = 0;
+    bool all = envInt("PROVELINE_ALL", 0) != 0;
     for (auto& [score, m] : replies) {
+        if (held && !all) break;  // a reply that holds settles the line
         std::string reply = moveToString(m);
         if (settled.count(reply)) {
             won += settled[reply] == "wins";
@@ -146,5 +149,7 @@ int cmdProveLine(const Args& args) {
     }
     printf("%zu replies: %zu with a winning answer, %zu where the attacker cannot win, %zu open\n", replies.size(), won, held,
            replies.size() - won - held);
+    if (held) printf("the attacker does not win this line\n");
+    else if (won == replies.size()) printf("the attacker WINS this line\n");
     return 0;
 }
