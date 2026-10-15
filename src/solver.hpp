@@ -213,8 +213,10 @@ struct Solver {
         auto result = [&](int lenMe, int lenOpp) { int d = lenMe + bonus - lenOpp; return d > 0 ? 1 : d < 0 ? -1 : 0; };
         // the opponent's placements that would lengthen its longest snake, longest first
         struct Reply { BB block; int len; };  // block: our cells that make the reply illegal
-        Reply replies[512];
+        constexpr int MAX_REPLIES = 512;  // reachable positions have at most 468 (41+ cells filled)
+        Reply replies[MAX_REPLIES];
         int nr = 0;
+        bool overflow = false;
         if (nOpp) {
             Pos asOpp = s;
             asOpp.stm = (uint8_t)opp;
@@ -222,8 +224,11 @@ struct Solver {
             asOpp.forEachLegal([&](Move q) {
                 const Placement& pl = q.pl();
                 int len = lengthAfter(s, opp, pl);
-                if (len > s.L[opp] && nr < 512) replies[nr++] = Reply{pl.nb & occ ? pl.m : pl.m | pl.nb, len};
+                if (len <= s.L[opp]) return;
+                if (nr == MAX_REPLIES) { overflow = true; return; }
+                replies[nr++] = Reply{pl.nb & occ ? pl.m : pl.m | pl.nb, len};
             });
+            if (overflow) return -2;  // let the search handle it
             std::sort(replies, replies + nr, [](const Reply& a, const Reply& b) { return a.len > b.len; });
         }
         auto oppBest = [&](BB ours) {

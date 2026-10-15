@@ -91,6 +91,11 @@ static BB parseHex128(const std::string& h) {
     return r;
 }
 // own0_own1_avail0_avail1_stm_ply_passes
+static std::string posStr(const Pos& s);
+// First line of a refute log: the position, the question (REFUTE_LOSS) and SOLVER_RED_BONUS.
+static std::string refuteHeader(const Pos& s) {
+    return "# refute " + posStr(s) + " loss " + std::to_string(envInt("REFUTE_LOSS", 0) != 0) + " bonus " + std::to_string(RED_BONUS);
+}
 static std::string posStr(const Pos& s) {
     return hex128(s.own[0]) + "_" + hex128(s.own[1]) + "_" + std::to_string(s.avail[0]) + "_" + std::to_string(s.avail[1]) +
            "_" + std::to_string(s.stm) + "_" + std::to_string(s.ply) + "_" + std::to_string(s.passes);
@@ -317,7 +322,9 @@ int main(int argc, char** argv) {
             while (std::getline(in, line)) {
                 std::istringstream ls(line);
                 Move m;
-                if (ls >> ms >> vs && parseMove(ms, m)) prev.push_back({m, vs == "win" ? 1 : vs == "loss" ? -1 : 0});  // notloss: 0
+                // a "notloss" line (from a SOLVER_WIN_TEST run) is no exact value: solved again in an exact run
+                if (!(ls >> ms >> vs) || !parseMove(ms, m) || (vs == "notloss" && !lossTest)) continue;
+                prev.push_back({m, vs == "win" ? 1 : vs == "loss" ? -1 : 0});
             }
             if (!prev.empty()) printf("resuming: %zu root moves already solved\n", prev.size());
             prog = fopen(pf, "a");
@@ -337,8 +344,10 @@ int main(int argc, char** argv) {
         if (prog) fclose(prog);
         int known = 0;
         for (auto& pm : r.perMove) known += pm.second != -9;
-        printf("ply %d stm %d: value %s  (%d/%zu root moves solved, %llu nodes, %.1fs)\n", (int)s.ply, (int)s.stm,
-               r.value == -9 ? "unknown" : std::to_string(r.value).c_str(), known, r.perMove.size(), (unsigned long long)r.nodes, r.seconds);
+        // the loss test's answer is "loses" or "does not lose", never an exact value (ui/server.js reads "value")
+        std::string verdict = r.value == -9 ? "value unknown" : !lossTest ? "value " + std::to_string(r.value) : r.value < 0 ? "loses" : "does not lose";
+        printf("ply %d stm %d: %s  (%d/%zu root moves solved, %llu nodes, %.1fs)\n", (int)s.ply, (int)s.stm, verdict.c_str(), known,
+               r.perMove.size(), (unsigned long long)r.nodes, r.seconds);
         for (auto& pm : r.perMove)
             if (pm.second != -9)
                 printf("  %-22s %s\n", moveStr(pm.first).c_str(), pm.second > 0 ? "win" : pm.second < 0 ? "loss" : lossTest ? "notloss" : "draw");
@@ -360,7 +369,8 @@ int main(int argc, char** argv) {
             while (in >> tok) first.push_back(tok);
         }
         bool mustLose = envInt("REFUTE_LOSS", 0) != 0;
-        RefuteResult r = refuteMoves(s, threads, argv[3], first);
+        RefuteResult r = refuteMoves(s, threads, argv[3], refuteHeader(s), first);
+        if (!r.error.empty()) { printf("%s\n", r.error.c_str()); return 1; }
         if (!r.survivor.empty()) printf("the side to move %s with %s\n", mustLose ? "does not lose" : "WINS", r.survivor.c_str());
         else if (r.refuted == r.total) printf("the side to move %s: all %zu moves refuted\n", mustLose ? "LOSES" : "cannot win", r.total);
         else printf("%zu of %zu moves refuted, rest unknown\n", r.refuted, r.total);
@@ -384,6 +394,10 @@ int main(int argc, char** argv) {
         }
         std::filesystem::create_directories(dir);
         std::string summaryPath = dir + "/summary.txt";
+        std::string header = "# proveline " + posStr(s) + " bonus " + std::to_string(RED_BONUS);
+        std::string have = firstLine(summaryPath);
+        if (!have.empty() && have != header) { printf("%s starts with \"%s\", not \"%s\"\n", summaryPath.c_str(), have.c_str(), header.c_str()); return 1; }
+        if (have.empty()) { FILE* f = fopen(summaryPath.c_str(), "a"); fprintf(f, "%s\n", header.c_str()); fclose(f); }
         std::map<std::string, std::string> done;  // defender reply -> "wins <answer>" / "holds"
         std::vector<std::string> answers;         // attacker answers that won, most recent first
         {
@@ -392,7 +406,7 @@ int main(int argc, char** argv) {
             while (std::getline(in, line)) {
                 std::istringstream ls(line);
                 std::string r, st, a;
-                if (!(ls >> r >> st)) continue;
+                if (line[0] == '#' || !(ls >> r >> st)) continue;
                 done[r] = st;
                 if (st == "wins" && ls >> a && std::find(answers.begin(), answers.end(), a) == answers.end()) answers.insert(answers.begin(), a);
             }
@@ -411,7 +425,8 @@ int main(int argc, char** argv) {
             std::string file = ms;
             for (char& ch : file) if (ch == ':' || ch == ',') ch = '_';
             auto t0 = std::chrono::steady_clock::now();
-            RefuteResult r = refuteMoves(a, threads, dir + "/" + file + ".log", answers);
+            RefuteResult r = refuteMoves(a, threads, dir + "/" + file + ".log", refuteHeader(a), answers);
+            if (!r.error.empty()) { printf("%s\n", r.error.c_str()); return 1; }
             double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             FILE* f = fopen(summaryPath.c_str(), "a");
             if (!r.survivor.empty()) {

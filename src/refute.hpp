@@ -10,7 +10,9 @@
 // Attacker moves are taken in the evaluation's order after the 8 best of a REFUTE_SEARCH (2) second
 // engine search; moves in `first` (answers that survived in sibling positions) are settled before all.
 // Log lines (resumable; every refutation is one position anyone can re-solve):
-// "<move> refuted <reply> [<nodes> <sec>]", "<move> open", "<move> wins" / "<move> holds".
+// "<move> refuted <reply> [<nodes> <sec>]", "<move> open", "<move> wins" / "<move> holds". The first line is
+// `header` (the position, the question and the bonus); a log that starts otherwise is not resumed, so a
+// log written for another position or question can never be read as this one's.
 #pragma once
 #include <atomic>
 #include <cstdio>
@@ -27,9 +29,26 @@
 struct RefuteResult {
     std::string survivor;  // an attacker move that survives (wins, or holds with REFUTE_LOSS); empty if none
     size_t refuted = 0, total = 0;
+    std::string error;     // the log belongs to something else: nothing was done
 };
 
-inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& logPath, const std::vector<std::string>& first = {}) {
+// The first line of `path`, or "" if the file is missing or empty.
+inline std::string firstLine(const std::string& path) {
+    std::ifstream in(path);
+    std::string line;
+    std::getline(in, line);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return line;
+}
+
+inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& logPath, const std::string& header,
+                                const std::vector<std::string>& first = {}) {
+    std::string have = firstLine(logPath);
+    if (!have.empty() && have != header) {
+        RefuteResult bad;
+        bad.error = logPath + " starts with \"" + have + "\", not \"" + header + "\"";
+        return bad;
+    }
     int maxTries = envInt("REFUTE_TRIES", 12);
     bool mustLose = envInt("REFUTE_LOSS", 0) != 0;
     uint64_t budget = (uint64_t)envInt("REFUTE_NODES", 60) * 1000000;
@@ -41,13 +60,14 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
         while (std::getline(in, line)) {
             std::istringstream ls(line);
             std::string m, st, r;
-            if (!(ls >> m >> st)) continue;
+            if (line[0] == '#' || !(ls >> m >> st)) continue;
             status[m] = st;
             Move rm;
             if (st == "refuted" && ls >> r && parseMove(r, rm)) killers[rm.gid]++;
         }
     }
     FILE* log = fopen(logPath.c_str(), "a");
+    if (have.empty()) { fprintf(log, "%s\n", header.c_str()); fflush(log); }
     // attacker moves, its best first by the evaluation (the search's favourites before them)
     std::vector<Move> all = uniqueRootMoves(s);
     std::vector<std::pair<double, Move>> ranked;
