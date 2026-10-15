@@ -367,10 +367,12 @@ struct Pos {
     }
 
     // Straightforward per-placement legality check (reference for the fast generator).
-    bool legal(const Placement& pl) const {
+    bool legal(const Placement& pl) const { return legalFor(stm, pl); }
+    // The same check for player c, whether or not it is c's turn (used for threats).
+    bool legalFor(int c, const Placement& pl) const {
         BB occ = own[0] | own[1];
         if (pl.m & occ) return false;
-        BB me = own[stm];
+        BB me = own[c];
         if ((pl.nb & occ) && !(pl.nb & me)) return false;  // new snake must touch nothing
         BB nw = me | pl.m;
         for (int j = 0; j < pl.n; j++) {
@@ -496,8 +498,16 @@ inline int pieceCount(uint8_t av) { return __builtin_popcount(av); }
 //    connected cluster K of (own | G). New cells come from whole pieces, and each
 //    piece lies inside one connected region of G, so the new cells in K are at most
 //    fit(sum over G-regions r in K of fit(|r|)).
-inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) {
+// The clusters themselves (cells and per-cluster upper bound), for threat detection.
+struct Clusters {
+    int n = 0;
+    BB cells[NCELLS];  // growable cells and own snakes of the cluster
+    int ub[NCELLS];    // upper bound of a final snake inside the cluster
+};
+template <bool Record>
+inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out) {
     lb = s.L[c];
+    if (Record) out->n = 0;
     uint8_t av = s.avail[c];
     if (!av) { ub = lb; return; }
     BB me = s.own[c];
@@ -529,7 +539,20 @@ inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) {
         if (into >= 0) { cl[into] |= cm; own[into] += popc(cm); }
     }
     ub = lb;
-    for (int i = 0; i < n; i++) ub = std::max(ub, own[i] + T.fit[av][std::min(cap[i], NIDX)]);
+    for (int i = 0; i < n; i++) {
+        int u = own[i] + T.fit[av][std::min(cap[i], NIDX)];
+        ub = std::max(ub, u);
+        if (Record) { out->cells[out->n] = cl[i]; out->ub[out->n++] = u; }
+    }
+}
+inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) { snakeBoundsImpl<false>(s, c, lb, ub, nullptr); }
+inline void snakeClusters(const Pos& s, int c, int& lb, int& ub, Clusters& out) { snakeBoundsImpl<true>(s, c, lb, ub, &out); }
+// Longest snake of player c if c placed pl (a legal placement for c) now.
+inline int lengthAfter(const Pos& s, int c, const Placement& pl) {
+    int merged = pl.n;
+    for (int j = 0; j < s.ncomp[c]; j++)
+        if (s.comp[c][j] & pl.nb) merged += popc(s.comp[c][j]);
+    return std::max<int>(s.L[c], merged);
 }
 inline int finalScore(const Pos& s) {  // from player 1's perspective: >0 player 1 wins
     return s.L[0] - s.L[1];

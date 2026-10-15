@@ -63,6 +63,9 @@ struct Solver {
     uint64_t nodeLimit = UINT64_MAX;
     // profiling counters per ply: visited, cut by TT, cut by bounds, expanded
     uint64_t pVisit[16] = {}, pTT[16] = {}, pBound[16] = {}, pExp[16] = {};
+    uint64_t pPruned[16] = {}, pMoves[16] = {};  // moves skipped by threat zones / moves generated, per ply
+    bool useThreats = envInt("SOLVER_THREATS", 1) != 0;
+    bool threatScan = envInt("SOLVER_THREAT_SCAN", 1) != 0;
     int evalOrderRem = envInt("SOLVER_EVAL_REM", 7);  // order children by the learned evaluation when >= this many pieces are left
     // deeper down, eval-order only where the side to move does not look lost: the losing side
     // has to try every move anyway, so ordering its moves is wasted work
@@ -90,6 +93,85 @@ struct Solver {
         int d = finalScore(s) + RED_BONUS;
         int v = d > 0 ? 1 : d < 0 ? -1 : 0;
         return s.stm == 0 ? v : -v;
+    }
+
+    // Threats. An opponent placement b is a threat when, if the opponent could play b right
+    // now as a free move, the snake bounds would already decide the game. Any move of ours
+    // that leaves b playable (does not cover b, and does not touch b when b starts a new
+    // snake) lets the opponent answer with b, and the bounds only tighten as cells fill up
+    // (our upper bound counts every cell we could still use, so it covers our move too).
+    // Such moves are therefore worth at most the bound value, and only moves through the
+    // zone of every threat strong enough for the current window need to be searched.
+    struct Threat {
+        BB zone;
+        int value;  // upper bound on our value for every move that leaves the zone free
+    };
+    static constexpr int MAX_THREATS = 6, MAX_TRIED = 8, MAX_FOUND = 64;
+
+    // Our value bound after the opponent plays b, or 2 if b is not a legal opponent placement.
+    static int threatValue(const Pos& s, const Placement& b, int piece) {
+        int me = s.stm, opp = me ^ 1;
+        if (!(s.avail[opp] >> piece & 1) || !s.legalFor(opp, b)) return 2;
+        Pos after = s;
+        after.own[opp] |= b.m;
+        int lbMe, ubMe;
+        snakeBounds(after, me, lbMe, ubMe);
+        ubMe += me == 0 ? RED_BONUS : -RED_BONUS;
+        int lbOpp = lengthAfter(s, opp, b);
+        return ubMe < lbOpp ? -1 : ubMe <= lbOpp ? 0 : 1;
+    }
+    static BB threatZone(const Pos& s, const Placement& b) {
+        bool grows = b.nb & s.own[s.stm ^ 1];
+        return grows ? b.m : b.m | b.nb;
+    }
+    // Adds the opponent placement gid as a threat if it is one (value <= 0).
+    static void addThreat(const Pos& s, int gid, Threat* threats, int& n, int* tried, int& nTried) {
+        if (gid < 0 || n >= MAX_THREATS || nTried >= MAX_TRIED) return;
+        for (int i = 0; i < nTried; i++) if (tried[i] == gid) return;
+        tried[nTried++] = gid;
+        auto [p, idx] = T.gidInfo[gid];
+        const Placement& b = T.PL[p][idx];
+        int v = threatValue(s, b, p);
+        if (v <= 0) threats[n++] = Threat{threatZone(s, b), v};
+    }
+    // Every opponent placement that is a threat for the current window, cheapest test first:
+    // a placement only lowers our bound inside the clusters it covers, so every cluster whose
+    // bound exceeds the opponent's length after the placement must be covered by it.
+    // Keeps the smallest zones (a zone containing a kept one prunes nothing more).
+    static void scanThreats(const Pos& s, int alpha, int bonus, Threat* threats, int& n) {
+        int me = s.stm, opp = me ^ 1;
+        Clusters cl;
+        int lbMe, ubMe;
+        snakeClusters(s, me, lbMe, ubMe, cl);
+        int strict = alpha < 0 ? 1 : 0;  // a loss needs our bound strictly below the opponent
+        Threat found[MAX_FOUND];
+        int nf = 0;
+        Pos asOpp = s;
+        asOpp.stm = (uint8_t)opp;
+        asOpp.forEachLegal([&](Move b) {
+            if (nf >= MAX_FOUND) return;
+            const Placement& pl = b.pl();
+            int need = lengthAfter(s, opp, pl) - bonus - strict;  // our raw upper bound must not exceed this
+            if (lbMe > need) return;
+            for (int i = 0; i < cl.n; i++)
+                if (cl.ub[i] > need && !(cl.cells[i] & pl.m)) return;
+            int v = threatValue(s, pl, b.piece());
+            if (v <= alpha) found[nf++] = Threat{threatZone(s, pl), v};
+        });
+        std::sort(found, found + nf, [](const Threat& a, const Threat& b) { return popc(a.zone) < popc(b.zone); });
+        for (int f = 0; f < nf && n < MAX_THREATS; f++) {
+            bool redundant = false;
+            for (int i = 0; i < n; i++)
+                if ((threats[i].zone & ~found[f].zone) == 0 && threats[i].value <= found[f].value) redundant = true;
+            if (!redundant) threats[n++] = found[f];
+        }
+    }
+    // Upper bound on our value for a move covering cells m (2 = no bound from the threats).
+    static int threatBound(BB m, const Threat* threats, int n) {
+        int v = 2;
+        for (int i = 0; i < n; i++)
+            if (!(m & threats[i].zone)) v = std::min(v, threats[i].value);
+        return v;
     }
 
     bool checkAbort() {
@@ -149,8 +231,22 @@ struct Solver {
         int ply = std::min<int>(s.ply, 31);
         int k1 = killer[ply][0], k2 = killer[ply][1];
         auto& H = hist[s.stm];
+        // threats: the opponent's refutations one ply down are the natural candidates
+        Threat threats[MAX_THREATS];
+        int nThreats = 0, tried[MAX_TRIED], nTried = 0;
+        int skipped = -2;  // best bound of the moves skipped because of threats
+        bool threatsOn = useThreats && s.avail[s.stm ^ 1] && ply < 31;
+        if (threatsOn) {
+            addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
+            addThreat(s, killer[ply + 1][1], threats, nThreats, tried, nTried);
+        }
+        bool scanned = !threatsOn || !threatScan;
         s.forEachLegal([&](Move m) {
             const Placement& pl = m.pl();
+            if (nThreats) {
+                int tb = threatBound(pl.m, threats, nThreats);
+                if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; return; }
+            }
             int sc = H[m.gid] + PIECE_CELLS[m.piece()] * 64;
             if (pl.nb & me) sc += 256;
             if (pl.m & oppFront) sc += 128;
@@ -180,8 +276,9 @@ struct Solver {
                     score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
             }
         }
+        pMoves[pp] += n;
         int best = -2, bestGid = -1;
-        if (n == 0) {
+        if (n == 0 && skipped == -2) {
             Pos c = s;
             c.play(Move{});
             best = -search(c, -beta, -alpha);
@@ -190,6 +287,10 @@ struct Solver {
                 int bi = i;
                 for (int j = i + 1; j < n; j++) if (score[j] > score[bi]) bi = j;
                 std::swap(moves[i], moves[bi]); std::swap(score[i], score[bi]);
+                if (nThreats) {
+                    int tb = threatBound(moves[i].pl().m, threats, nThreats);
+                    if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; continue; }
+                }
                 Pos c = s;
                 c.play(moves[i]);
                 int v = -search(c, -beta, -alpha);
@@ -201,7 +302,15 @@ struct Solver {
                     if (killer[ply][0] != moves[i].gid) { killer[ply][1] = killer[ply][0]; killer[ply][0] = moves[i].gid; }
                     break;
                 }
+                // the refutation just found may be a threat against the remaining moves; once the
+                // first move failed, this is probably a node where every move must be refuted, so
+                // look for all the opponent's threats
+                if (threatsOn && i + 2 < n) {
+                    addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
+                    if (!scanned) { scanned = true; scanThreats(s, alpha, bonus, threats, nThreats); }
+                }
             }
+            best = std::max(best, skipped);
         }
         if (aborted) return 0;
         // store
