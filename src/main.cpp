@@ -341,7 +341,7 @@ int main(int argc, char** argv) {
         // (60M) nodes each, attacker moves spread over threads. Pass 2, for the moves pass 1 left open:
         // every defender reply, most promising first, with SOLVER_WIN_TEST-style parallelSolve - either
         // a refutation or a proof that the move wins. Both passes alternate on chunks of REFUTE_CHUNK (64)
-        // attacker moves and stop at the first move that survives. Log lines (resumable; every refutation is a
+        // attacker moves and stop at the first move that survives; REFUTE_FIRST lists moves to settle first. Log lines (resumable; every refutation is a
         // position anyone can re-solve): "<move> refuted <reply> <nodes> <sec>", "<move> open",
         // "<move> wins".
         if (argc < 5) { printf("usage: snek refute <threads> <log> <moves...>\n"); return 1; }
@@ -398,6 +398,11 @@ int main(int argc, char** argv) {
                         size_t k = next++;
                         if (k >= to) break;
                         Move m = todo[k];
+                        {
+                            std::lock_guard<std::mutex> lk(mu);
+                            auto it = status.find(moveStr(m));
+                            if (it != status.end() && !it->second.empty()) continue;  // settled already (REFUTE_FIRST)
+                        }
                         Pos a = s; a.play(m);
                         std::vector<Move> replies;
                         a.genMoves(replies);
@@ -466,6 +471,18 @@ int main(int argc, char** argv) {
         // alternate in chunks of REFUTE_CHUNK moves, so that a strong move that survives is found
         // without first refuting every weaker one
         size_t chunk = std::max(1, envInt("REFUTE_CHUNK", 64));
+        // REFUTE_FIRST=<file>: moves to settle before any other (one per line), e.g. answers that
+        // survived in sibling positions - the same move often wins against many defender replies
+        if (const char* first = getenv("REFUTE_FIRST")) {
+            std::ifstream in(first);
+            std::string tok;
+            while (in >> tok) {
+                Move fm;
+                if (!parseMove(tok, fm) || std::find(all.begin(), all.end(), fm) == all.end() || status.count(moveStr(fm))) continue;
+                tok = moveStr(fm);
+                status[tok] = "open";
+            }
+        }
         fullPass();
         for (size_t from = 0; from < todo.size() && survivor.empty(); from += chunk) {
             quickPass(from, std::min(todo.size(), from + chunk));
