@@ -33,14 +33,17 @@ which `tools/fit_eval.py` writes.
 | 11 | `screened_win_test.hpp` | Win test that looks for cheap proofs first: the best moves are screened by small probes of their replies |
 | 12 | `engine.hpp` | **Playing engine**: iterative-deepening PVS with forward pruning, multi-PV, score smoothing; in `ab2` also exact verdicts on the root moves |
 | 13 | `analysis.hpp` | "Analyse this position" for the UI: exact when few pieces are left, otherwise the engine |
-| 14 | `mcts.hpp` | The first engine (Monte-Carlo tree search), kept for comparison |
-| 15 | `notation.hpp`, `training_data.hpp` | Moves and positions as text; CSV rows for training the evaluation |
-| 16 | `main.cpp`, `commands.hpp` | Table of all commands with their arguments |
-| 17 | `cmd_*.cpp` | One file per group of commands: `serve` (UI protocol), `solve` (solvepos, solvebench, benchset), `refute` (the side to move cannot win), `check` (perft, verify, info, speed), `data` (gendata, refeature, evalexplain, evaltrace), `play` (arena, selfplay), `worker` (distributed solving) |
+| 14 | `refute.hpp` | **Refutation sweep**: does the side to move win, or can each of its moves be refuted? Node-limited tries of likely refutations, then full yes/no solves, on chunks of moves; resumable log |
+| 15 | `mcts.hpp` | The first engine (Monte-Carlo tree search), kept for comparison |
+| 16 | `notation.hpp`, `training_data.hpp` | Moves and positions as text; CSV rows for training the evaluation |
+| 17 | `main.cpp`, `commands.hpp` | Table of all commands with their arguments |
+| 18 | `cmd_*.cpp` | One file per group of commands: `serve` (UI protocol), `solve` (solvepos, solvebench, benchset), `refute` (refute, proveline), `check` (perft, verify, info, speed), `data` (gendata, refeature, evalexplain, evaltrace), `play` (arena, selfplay), `worker` (distributed solving) |
 
 To see how a position gets solved, read `rules.hpp`, then `bounds.hpp`, then `solver.hpp`, and
 `screened_win_test.hpp` for the win test that picks cheap proofs. To see where the engine's move comes
-from, read `evaluation.hpp`, then `engine.hpp`, then `analysis.hpp`.
+from, read `evaluation.hpp`, then `engine.hpp`, then `analysis.hpp`. To see how a line of play gets
+proved one reply at a time, read `parallel_solve.hpp`, then `refute.hpp`, then `proveline` in
+`cmd_refute.cpp`.
 
 ## Names: original to readable
 
@@ -84,6 +87,9 @@ from, read `evaluation.hpp`, then `engine.hpp`, then `analysis.hpp`.
 | `analyzeAb`, `g_engine` | `analyzeAlphaBeta`, `DEFAULT_ENGINE` / `ServedGame::engine` |
 | `terminalScore` | `finishedGameScore` |
 | `uniqueRootMoves` | `symmetryUniqueMoves` |
+| `refuteMoves`, `RefuteResult` (`refute.hpp`) | `refuteMoves`, `RefuteResult`; the sweep is a `RefutationSweep` |
+| `quickPass`, `fullPass`, `killers`, `SEARCH_TOP`, `searchSecs` | `quickPass` (`tryRefutations` per move), `fullPass`, `refutations`, `SEARCH_FAVOURITES`, `searchSeconds` |
+| proveline's `done`, `answers` | `settled`, `winningAnswers` |
 | `moveStr`, `posStr`, `parsePosStr` | `moveToString`, `positionToString`, `parsePosition` |
 | `-9` | `Solver::UNKNOWN` |
 
@@ -102,23 +108,22 @@ Some details look arbitrary but decide the exact node counts, the move order and
 - **Move ordering**: all scores (killers, `+256` / `+128` / `+32` bonuses, evaluation × 1000; the
   engine's history), the selection sort of the solver's first three moves that keeps the earlier move
   on ties, the one sort of the rest by score and then placement id, and `std::sort` (not stable) on
-  the same input arrays (also the threats by zone size and the last pieces' replies).
+  the same input arrays (also the threats by zone size, the last pieces' replies and the replies the
+  refutation sweep tries).
 - **Threat lists**: at most 6 threats per node, 8 placements tried one by one, 64 found per scan; the
   killers of the next ply are tried before the moves are generated.
 - **Transposition-table layout** and its replacement rule.
-- **Floating point**: the logit is summed in feature order, and `learnedLogit` stays out of line, so
-  that every caller gets the same rounding (inlined, the compiler fuses the multiply-adds in some
-  callers and not in others); `(int)(1000 * logit)` truncates and `lround(100 * z)` rounds, as before.
+- **Floating point**: the logit is summed in feature order, and `learnedLogit` and the sum that
+  `evalexplain` prints stay out of line, so that every caller rounds the same, and as in `src/`
+  (inlined, the compiler fuses the multiply-adds in some callers and not in others);
+  `(int)(1000 * logit)` truncates and `lround(100 * z)` rounds, as before.
 - **Output formats**: JSON for the UI, CSV for training data, the worker protocol, the `solvepos`
-  progress lines, the `refute` log.
+  progress lines, the `refute` log, the `proveline` summary and its log names.
 
 ## Differences from `src/`
 
 - An unknown command prints the list of commands (`src/` silently exits).
 - Missing required arguments of `solvepos` and `evaltrace` fall back to defaults instead of crashing.
-- `verify` compares the bounds with a reference that applies the k + 1 snakes rule as well. The
-  reference in `src/` does not, so `src/`'s `verify` reports a `BOUNDS MISMATCH` (game 2, ply 12) where
-  the fast bound is tighter; with the rule added to its reference it prints the same as here.
 
 ## Verification
 
@@ -128,13 +133,14 @@ above) were run on the same inputs and the outputs compared with timings removed
 | Check | What it covers |
 |-------|----------------|
 | `perft 3` | 91 / 194 388 / 315 706 848: move generation |
-| `verify 2000`, `verify 3000` | 31 391 / 47 131 positions: fast generator vs rule check, fast vs reference bounds, bounds vs final results (`src/` with the k + 1 rule in its reference, see above) |
+| `verify 2000`, `verify 3000` | 31 391 / 47 131 positions: fast generator vs rule check, fast vs reference bounds, bounds vs final results |
 | `info`, `speed` | placement counts; the checksums of the hot functions |
 | `solvebench` 8 6, 10 10, 7 12, 6 12 and 5 3 (1 thread) | values and node counts of the exact solver; also with `SOLVER_PNS=1`, `SOLVER_RED_BONUS=±1`, `SOLVER_THREATS=0`, `SOLVER_THREAT_SCAN=0 SOLVER_LAST=0 SOLVER_KILLERS_OVER_EVAL=0` and `SOLVER_ETC_REM=8` |
 | `BENCH_FRESH=1 PROFILE=1 benchset` on the four `bench/ply5_*` sets (1 thread) | exact values, `BENCH_WINTEST=1` and `BENCH_WINTEST=1 BENCH_PNS=1`: node counts per position, per-ply statistics, probes and screens. On `ply5_blue_wins.txt` 28 568 903, 25 417 308 and 12 768 835 nodes |
 | the same with `-DSOLVER_TIMING` | node counts and statistics; the timing table has the same rows and steps |
 | `solvepos` at plies 6 and 7 (1 thread), also with `SOLVER_WIN_TEST=1`, a `PROGRESS` log and its resume | root-move results and node counts |
-| `refute 1 <log> 1:60 4B:16,27,28,39 3V:40,41,50 4A:62,72,82,93 4A:58,59,68,78 3V:31,42,52 4I:7,8,9,10`, resumed, with `REFUTE_LOSS=1` and with small `REFUTE_CHUNK` / `REFUTE_TRIES` / `REFUTE_NODES` (both passes) | output and log: every refutation, open move and survivor |
+| `refute 1 <log>` after `1:60 4B:16,27,28,39 3V:40,41,50 4A:62,72,82,93 4A:58,59,68,78 3V:31,42,52 4I:7,8,9,10` (blue cannot win) and after `1:60 4B:16,27,28,39 3V:29,40,50 4A:6,7,8,19 2:89,99 4C:49,59,70,71 3I:94,104,114` (blue wins); also with `REFUTE_FIRST`, `REFUTE_SEARCH=0`, `REFUTE_LOSS=1` and small `REFUTE_CHUNK` / `REFUTE_TRIES` / `REFUTE_NODES` (both passes), and resumed from part of a log | output and log: every refutation, open move and survivor |
+| `proveline 1 <dir>` after `1:60 4B:16,27,28,39 3V:29,40,50 4A:6,7,8,19 2:89,99 4C:49,59,70,71 3I:94,104,114 2:20,21`, resumed after 100 of its 223 replies, and its refusal of `REFUTE_LOSS=1` | output, summary and the sweeps' logs |
 | `serve 1`: state, set, play, undo, children, engine, analyze and go (`ab` and `ab2`, where their answer does not depend on time), solve, errors, `SERVE_PROGRESS=1` | UI protocol |
 | `gendata` (normal and `good` mode, 1 thread), `refeature`, `evalexplain`, `evaltrace 3` | training rows; features, learned evaluation, fixed-depth search of `ab` |
 | fixed-depth `analyzeWithEngine` / `abAnalyze` of `ab` and `ab2` on two games (1 thread, multi-PV 1 and 8, depths 1-4), from a small test program calling them | depth, scores, displayed scores, verdicts and nodes of every root move |
@@ -142,7 +148,9 @@ above) were run on the same inputs and the outputs compared with timings removed
 
 With several threads the order of the work depends on timing, so those runs were compared by their
 results: `solvepos` with 4 threads (exact, and `SOLVER_WIN_TEST=1` at ply 5), `refute 2` (the same
-verdict for every move) and `benchset` with 4 threads (the same values). Timing-dependent commands
-(`arena`, `selfplay`, MCTS) cannot be compared output to output. They run, and their results are the
-same within normal variation. Single-thread `benchset` times of the two builds, run in turns, are
-within noise of each other.
+verdict for every move) and `benchset` with 4 threads (the same values). The engine search that picks
+`refute`'s first moves stops after `REFUTE_SEARCH` seconds, so its favourites could depend on timing;
+in the positions above they were the same in every run. Timing-dependent commands (`arena`,
+`selfplay`, MCTS) cannot be compared output to output. They run, and their results are the same within
+normal variation. Single-thread `benchset` times of the two builds, run in turns, are within noise of
+each other.
