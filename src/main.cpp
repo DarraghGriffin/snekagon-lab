@@ -367,6 +367,7 @@ int main(int argc, char** argv) {
         // the line shows up early. dir/summary.txt gets one line per reply ("<reply> wins <answer>" or
         // "<reply> holds"); dir/<reply>.log are the sweeps' resumable logs; a rerun continues.
         if (argc < 5) { printf("usage: snek proveline <threads> <dir> <moves...>\n"); return 1; }
+        if (envInt("REFUTE_LOSS", 0)) { printf("proveline proves wins; REFUTE_LOSS is for refute only\n"); return 1; }
         int threads = std::atoi(argv[2]);
         std::string dir = argv[3];
         Pos s = Pos::start();
