@@ -71,6 +71,7 @@ struct Solver {
     uint64_t pPruned[16] = {}, pMoves[16] = {}, pLast[16] = {}, pScans[16] = {}, pScanHits[16] = {};  // ... / nodes solved by lastPieces  // moves skipped by threat zones / moves generated, per ply
     bool useThreats = envInt("SOLVER_THREATS", 1) != 0;
     bool useLastPieces = envInt("SOLVER_LAST", 1) != 0;
+    bool killersOverEval = envInt("SOLVER_KILLERS_OVER_EVAL", 1) != 0;  // killers ahead of the learned-eval ordering
     bool threatScan = envInt("SOLVER_THREAT_SCAN", 1) != 0;
     int evalOrderRem = envInt("SOLVER_EVAL_REM", 7);  // order children by the learned evaluation when >= this many pieces are left
     // deeper down, eval-order only where the side to move does not look lost: the losing side
@@ -365,15 +366,17 @@ struct Solver {
         int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
         bool doEval = n > 1 && (rem >= evalOrderRem || (rem >= evalOrderRemWin && learnedLogit(s) > evalWinThreshold));
         bool doEtc = n > 0 && rem >= etcRem;
-        // the evaluation is expensive: when the table or a killer suggests a move, try it first and
-        // evaluate the other moves only if it does not cut off
+        // moves scored at least `ahead` (the table move, and the killers unless killersOverEval is off)
+        // stay ahead of the evaluation ordering. The evaluation is expensive: when such a move exists it
+        // is tried first, and the other moves are evaluated only if it does not cut off
+        int ahead = killersOverEval ? 1 << 28 : 1 << 30;
         bool evalLater = false;
         if (doEval && !doEtc)
-            for (int i = 0; i < n && !evalLater; i++) evalLater = score[i] >= (1 << 28);
+            for (int i = 0; i < n && !evalLater; i++) evalLater = score[i] >= ahead;
         if (evalLater) doEval = false;
         auto evaluateRest = [&](int from) {
             for (int i = from; i < n; i++)
-                if (score[i] < (1 << 28)) {
+                if (score[i] < ahead) {
                     Pos c = s; c.play(moves[i]);
                     score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
                 }

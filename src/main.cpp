@@ -19,6 +19,7 @@
 #include "mcts.hpp"
 #include "search.hpp"
 #include "solver.hpp"
+#include "pns.hpp"
 #include "serve.hpp"
 #include "worker.hpp"
 
@@ -517,17 +518,28 @@ int main(int argc, char** argv) {
         bool fresh = envInt("BENCH_FRESH", 0) != 0;
         bool winTest = envInt("BENCH_WINTEST", 0) != 0;  // BENCH_WINTEST=1: only ask whether the side to move wins
         int ttLog2 = envInt("SOLVER_TT", 22);
+        bool pns = winTest && envInt("BENCH_PNS", 0) != 0;  // BENCH_PNS=1: the win test of pns.hpp (cheap proofs first)
+        std::vector<std::string> pnsInfo(ps.size());
         for (int w = 0; w < threads; w++)
             th.emplace_back([&] {
-                std::unique_ptr<Solver> SP(shared ? new Solver(shared) : new Solver(ttLog2));
-                Solver& S = *SP;
+                std::unique_ptr<PnSearch> PN(pns ? new PnSearch(ttLog2) : nullptr);
+                std::unique_ptr<Solver> SP(pns ? nullptr : shared ? new Solver(shared) : new Solver(ttLog2));
+                Solver& S = pns ? PN->ab : *SP;
                 for (;;) {
                     size_t i = next++;
                     if (i >= ps.size()) break;
                     if (fresh) S.clear();  // BENCH_FRESH=1: every position starts from an empty table (deterministic counts)
                     auto ts = std::chrono::steady_clock::now();
-                    val[i] = winTest ? S.solve(ps[i], 0, UINT64_MAX, 0, 1) : S.solve(ps[i]);
-                    nod[i] = S.nodes;
+                    if (pns) {
+                        val[i] = PN->solveWin(ps[i], ps[i].stm);
+                        nod[i] = PN->nodes();
+                        char buf[160];
+                        snprintf(buf, sizeof buf, "  probes %llu  screens %llu", (unsigned long long)PN->probes, (unsigned long long)PN->screens);
+                        pnsInfo[i] = buf;
+                    } else {
+                        val[i] = winTest ? S.solve(ps[i], 0, UINT64_MAX, 0, 1) : S.solve(ps[i]);
+                        nod[i] = S.nodes;
+                    }
                     {
                         std::lock_guard<std::mutex> lk(profMu);
                         for (int p = 0; p < 16; p++) {
@@ -549,7 +561,7 @@ int main(int argc, char** argv) {
         uint64_t tn = 0;
         double ts = 0;
         for (size_t i = 0; i < ps.size(); i++) {
-            printf("%3zu  value %2d  %12llu nodes  %7.1fs\n", i, val[i], (unsigned long long)nod[i], sec[i]);
+            printf("%3zu  value %2d  %12llu nodes  %7.1fs%s\n", i, val[i], (unsigned long long)nod[i], sec[i], pnsInfo[i].c_str());
             tn += nod[i]; ts += sec[i];
         }
         printf("TOTAL %zu positions: %llu nodes, %.1f thread-seconds, %.1f s wall (%d threads)\n", ps.size(), (unsigned long long)tn, ts, wall, threads);
@@ -743,12 +755,15 @@ int main(int argc, char** argv) {
         int count = argc > 3 ? std::atoi(argv[3]) : 10;
         double secs = argc > 4 ? std::atof(argv[4]) : 60;
         int threads = argc > 5 ? std::atoi(argv[5]) : 1;
+        bool pns = envInt("SOLVER_PNS", 0) != 0;  // SOLVER_PNS=1: values from two win tests of pns.hpp
         std::atomic<int> next{0};
         std::mutex mu;
         std::vector<std::thread> th;
         for (int w = 0; w < threads; w++)
             th.emplace_back([&, w] {
-                Solver solver(21);
+                std::unique_ptr<PnSearch> pn(pns ? new PnSearch(21) : nullptr);
+                std::unique_ptr<Solver> own(pns ? nullptr : new Solver(21));
+                Solver& solver = pns ? pn->ab : *own;
                 for (;;) {
                     int i = next++;
                     if (i >= count) break;
@@ -756,12 +771,13 @@ int main(int argc, char** argv) {
                     Pos s = randomPosition(plies, rng);
                     solver.clear();
                     auto t0 = std::chrono::steady_clock::now();
-                    int v = solver.solve(s, secs);
+                    int v = pns ? pn->solveValue(s, secs) : solver.solve(s, secs);
+                    uint64_t nodes = pns ? pn->totalNodes : solver.nodes;
                     double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                     std::lock_guard<std::mutex> lk(mu);
                     printf("plies=%d pos=%d value(stm)=%s nodes=%llu time=%.3fs knps=%.0f\n", plies, i,
-                           v == -9 ? "timeout" : std::to_string(v).c_str(), (unsigned long long)solver.nodes, el,
-                           solver.nodes / el / 1000);
+                           v == -9 ? "timeout" : std::to_string(v).c_str(), (unsigned long long)nodes, el,
+                           nodes / el / 1000);
                     fflush(stdout);
                 }
             });
