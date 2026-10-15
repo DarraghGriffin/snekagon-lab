@@ -498,6 +498,9 @@ inline int pieceCount(uint8_t av) { return __builtin_popcount(av); }
 //    connected cluster K of (own | G). New cells come from whole pieces, and each
 //    piece lies inside one connected region of G, so the new cells in K are at most
 //    fit(sum over G-regions r in K of fit(|r|)).
+//  - Every old snake ends up whole inside the final snake or not at all, and the final
+//    snake is a path in which old snakes and new pieces alternate, so with k pieces left
+//    it contains at most k + 1 old snakes: only the k + 1 longest of the cluster count.
 // The clusters themselves (cells and per-cluster upper bound), for threat detection.
 struct Clusters {
     int n = 0;
@@ -537,6 +540,18 @@ inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out
             i--;
         }
         if (into >= 0) { cl[into] |= cm; own[into] += popc(cm); }
+    }
+    int joinable = pieceCount(av) + 1;
+    if (s.ncomp[c] > joinable) {
+        for (int i = 0; i < n; i++) {
+            int len[8], m = 0;
+            for (int j = 0; j < s.ncomp[c]; j++)
+                if (cl[i] & s.comp[c][j]) len[m++] = popc(s.comp[c][j]);
+            if (m <= joinable) continue;
+            std::sort(len, len + m, std::greater<int>());
+            own[i] = 0;
+            for (int j = 0; j < joinable; j++) own[i] += len[j];
+        }
     }
     ub = lb;
     for (int i = 0; i < n; i++) {

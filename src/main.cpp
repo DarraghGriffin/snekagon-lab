@@ -361,6 +361,7 @@ int main(int argc, char** argv) {
         int sharedLog2 = envInt("SOLVER_SHARED", 0);
         std::shared_ptr<LTT> shared = sharedLog2 ? std::make_shared<LTT>(sharedLog2 - 1) : nullptr;
         bool fresh = envInt("BENCH_FRESH", 0) != 0;
+        bool winTest = envInt("BENCH_WINTEST", 0) != 0;  // BENCH_WINTEST=1: only ask whether the side to move wins
         int ttLog2 = envInt("SOLVER_TT", 22);
         for (int w = 0; w < threads; w++)
             th.emplace_back([&] {
@@ -371,7 +372,7 @@ int main(int argc, char** argv) {
                     if (i >= ps.size()) break;
                     if (fresh) S.clear();  // BENCH_FRESH=1: every position starts from an empty table (deterministic counts)
                     auto ts = std::chrono::steady_clock::now();
-                    val[i] = S.solve(ps[i]);
+                    val[i] = winTest ? S.solve(ps[i], 0, UINT64_MAX, 0, 1) : S.solve(ps[i]);
                     nod[i] = S.nodes;
                     {
                         std::lock_guard<std::mutex> lk(profMu);

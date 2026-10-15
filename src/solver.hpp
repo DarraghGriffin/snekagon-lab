@@ -374,9 +374,11 @@ struct Solver {
         return best;
     }
 
-    // Returns value for the side to move, or -9 if aborted.
+    // Returns value for the side to move, or -9 if aborted. A narrower window answers a
+    // yes/no question more cheaply: (0, 1) asks "does the side to move win?" (result 1 or
+    // <= 0), (-1, 0) asks "does it avoid losing?" (result >= 0 or -1).
     // (parallel version: see parallelSolve below)
-    int solve(const Pos& s, double seconds = 0, uint64_t maxNodes = UINT64_MAX) {
+    int solve(const Pos& s, double seconds = 0, uint64_t maxNodes = UINT64_MAX, int alpha = -1, int beta = 1) {
         aborted = false;
         nodes = 0;
         nodeLimit = maxNodes;
@@ -384,7 +386,7 @@ struct Solver {
         if (useDeadline)
             deadline = std::chrono::steady_clock::now() +
                        std::chrono::microseconds((long long)(seconds * 1e6));
-        int v = search(s, -1, 1);
+        int v = search(s, alpha, beta);
         return aborted ? -9 : v;
     }
 };
