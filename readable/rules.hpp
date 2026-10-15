@@ -47,10 +47,12 @@ inline SnakeShape snakeShapeOf(Bitboard own) {
 
 // ---- reference rule check (one placement at a time) ------------------------------------------
 
-inline bool isLegalPlacement(const Position& pos, const Placement& p) {
+// Whether `player` may place p, whether or not it is that player's turn (the solver asks what the
+// opponent could play next).
+inline bool isLegalPlacementFor(const Position& pos, int player, const Placement& p) {
     Bitboard occupied = pos.occupied();
     if (p.cells & occupied) return false;
-    Bitboard own = pos.ownCells();
+    Bitboard own = pos.cells[player];
     bool touchesOwn = p.border & own;
     if (!touchesOwn && (p.border & occupied)) return false;  // a new snake must not touch anything
     Bitboard ownAfter = own | p.cells;
@@ -70,6 +72,10 @@ inline bool isLegalPlacement(const Position& pos, const Placement& p) {
         if (countCells(geometry.neighbours[i] & ownAfter) > 2) return false;
     }
     return true;
+}
+
+inline bool isLegalPlacement(const Position& pos, const Placement& p) {
+    return isLegalPlacementFor(pos, pos.sideToMove, p);
 }
 
 // ---- fast move generator ---------------------------------------------------------------------
@@ -122,9 +128,10 @@ inline Bitboard legalAnchors(const Orientation& o, const MoveGenContext& g) {
     return newSnake | grow;
 }
 
-// Calls f(move) for every legal placement (not for a pass), in placement-id order.
-template <class F>
-inline void forEachLegalMove(const Position& pos, F&& f) {
+// Calls f(move) for every legal placement (not for a pass) in placement-id order; with
+// OnlyCovering, only for the placements that cover at least one cell of `cover`.
+template <bool OnlyCovering, class F>
+inline void forEachLegalMoveIn(const Position& pos, Bitboard cover, F&& f) {
     PieceSet allowed = pos.piecesAllowedNow();
     if (!allowed) return;
     MoveGenContext g = moveGenContext(pos);
@@ -132,9 +139,29 @@ inline void forEachLegalMove(const Position& pos, F&& f) {
         if (!hasPiece(allowed, piece)) continue;
         for (int o = pieceTables.firstOrientation[piece]; o < pieceTables.firstOrientation[piece + 1]; o++) {
             const Orientation& orientation = pieceTables.orientations[o];
-            forEachCell(legalAnchors(orientation, g), [&](int anchor) { f(Move{orientation.placementAt[anchor]}); });
+            Bitboard anchors = legalAnchors(orientation, g);
+            if constexpr (OnlyCovering) {
+                // the anchors at which some cell of the piece lands on `cover`
+                Bitboard covering = 0;
+                if (anchors)
+                    for (int k = 0; k < orientation.size; k++) covering |= cellsWithOffsetIn(cover, orientation.dq[k], orientation.dr[k]);
+                anchors &= covering;
+            }
+            forEachCell(anchors, [&](int anchor) { f(Move{orientation.placementAt[anchor]}); });
         }
     }
+}
+
+// Calls f(move) for every legal placement (not for a pass), in placement-id order.
+template <class F>
+inline void forEachLegalMove(const Position& pos, F&& f) {
+    forEachLegalMoveIn<false>(pos, 0, f);
+}
+
+// The same for only the legal placements that cover at least one cell of `cover`.
+template <class F>
+inline void forEachLegalMoveCovering(const Position& pos, Bitboard cover, F&& f) {
+    forEachLegalMoveIn<true>(pos, cover, f);
 }
 
 // All legal placements. Empty means the side to move has to pass.

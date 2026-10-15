@@ -9,10 +9,13 @@
 //   analyze [seconds]       analyse, up to 8 moves with exact scores   -> analysis
 //   go [seconds]            analyse and play the best move             -> {played, analysis, state}
 //   solve [seconds]         parallel exact solve                       -> value per root move
+//                           (env SERVE_PROGRESS=1: first a {"progress":true,...} line per
+//                           solved root move, for the UI's progress bar)
 //   children <move>...      symmetry-unique moves of that position, best first by the learned
 //                           evaluation (used by the distributed-solve coordinator)
-//   engine ab|mcts          choose the engine for analyze/go
+//   engine ab2|ab|mcts      choose the engine for analyze/go (default ab2)
 //   quit
+#include <functional>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -56,6 +59,10 @@ class ServedGame {
   public:
     explicit ServedGame(int threads) : threads(threads), solver(22) {}
 
+    // If set, `solve` reports every root move it proves through this, as a JSON line, before its
+    // answer.
+    std::function<void(const std::string&)> progress;
+
     std::string handle(const std::string& command, std::istringstream& in) {
         if (command == "new") { replay({}); return stateJson(); }
         if (command == "set" || command == "play") return setMoves(command == "play", in);
@@ -72,7 +79,7 @@ class ServedGame {
         if (command == "engine") {
             std::string name;
             in >> name;
-            if (name == "ab" || name == "mcts") engine = name;
+            if (name == "ab" || name == "ab2" || name == "mcts") engine = name;
             return "{\"ok\":true,\"engine\":\"" + engine + "\"}";
         }
         return "{\"ok\":false,\"error\":\"unknown command\"}";
@@ -81,7 +88,7 @@ class ServedGame {
   private:
     int threads;
     Solver solver;
-    std::string engine = "ab";
+    std::string engine = DEFAULT_ENGINE;
     Position pos = Position::initial();
     std::vector<Move> history;
 
@@ -153,7 +160,23 @@ class ServedGame {
         double seconds = 10;
         in >> seconds;
         if (pos.isOver()) return GAME_OVER;
-        RootSolveResult r = parallelSolve(pos, seconds, threads, 21);
+        // progress: a line per solved root move - moves solved so far (of all), how many of them
+        // win / draw / lose, the time so far and the move just solved
+        size_t total = progress ? symmetryUniqueMoves(pos).size() : 0;
+        int solved = 0, wins = 0, draws = 0, losses = 0;
+        auto start = std::chrono::steady_clock::now();
+        RootMoveCallback onResult;
+        if (progress)
+            onResult = [&](Move m, int value, uint64_t, double) {
+                solved++;
+                (value > 0 ? wins : value < 0 ? losses : draws)++;
+                std::ostringstream p;
+                p << "{\"progress\":true,\"solved\":" << solved << ",\"total\":" << total << ",\"wins\":" << wins
+                  << ",\"draws\":" << draws << ",\"losses\":" << losses << ",\"seconds\":" << secondsSince(start)
+                  << ",\"m\":" << moveJson(m) << ",\"v\":" << value << "}";
+                progress(p.str());
+            };
+        RootSolveResult r = parallelSolve(pos, seconds, threads, 21, {}, onResult);
         // wins first, then draws, unknown, losses
         auto rank = [](int v) { return v == Solver::UNKNOWN ? -0.5 : (double)v; };
         std::stable_sort(r.perMove.begin(), r.perMove.end(), [&](auto& a, auto& b) { return rank(a.second) > rank(b.second); });
@@ -191,6 +214,8 @@ class ServedGame {
 int cmdServe(const Args& args) {
     int threads = args.arg(2, (int)std::max(1u, std::thread::hardware_concurrency() - 2));
     ServedGame game(threads);
+    // SERVE_PROGRESS=1 (set by ui/server.js): solve also prints its progress lines
+    if (getenv("SERVE_PROGRESS")) game.progress = [](const std::string& line) { std::cout << line << "\n" << std::flush; };
     std::string line;
     while (std::getline(std::cin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();

@@ -5,12 +5,13 @@
 
 // snek arena [pairs] [s/move] [threads] [engineA] [engineB] [seed] [randomPlies]
 // Engine A against engine B from random openings (`randomPlies` random moves). Every opening is
-// played twice with the colours swapped (once if both engines are the same).
+// played twice with the colours swapped (once if both engines are the same). The printed game
+// records start with the opening, so they replay from the start.
 int cmdArena(const Args& args) {
     int pairs = args.arg(2, 10);
     double seconds = args.arg(3, 1.0);
     int threads = args.arg(4, 8);
-    std::string engineA = args.arg(5, "ab"), engineB = args.arg(6, "mcts");
+    std::string engineA = args.arg(5, DEFAULT_ENGINE), engineB = args.arg(6, "mcts");
     uint64_t seed = args.argU64(7, 2024);
     int randomPlies = args.arg(8, 2);
     Solver solver(22);
@@ -19,15 +20,18 @@ int cmdArena(const Args& args) {
     std::vector<Move> moves;
     for (int pair = 0; pair < pairs; pair++) {
         Position opening = Position::initial();
+        std::string openingRecord;
         for (int k = 0; k < randomPlies; k++) {
             generateMoves(opening, moves);
-            opening.play(moves[rng.below((int)moves.size())]);
+            Move m = moves[rng.below((int)moves.size())];
+            openingRecord += moveToString(m) + " ";
+            opening.play(m);
         }
         int games = engineA == engineB ? 1 : 2;  // identical engines would play the same game twice
         for (int swapped = 0; swapped < games; swapped++) {
             std::string engine[2] = {swapped ? engineB : engineA, swapped ? engineA : engineB};  // red, blue
             Position pos = opening;
-            std::string record;
+            std::string record = openingRecord;
             while (!pos.isOver()) {
                 Move m = analyze(pos, seconds, threads, solver, engine[pos.sideToMove]).items[0].move;
                 record += moveToString(m) + " ";
@@ -58,7 +62,7 @@ int cmdSelfPlay(const Args& args) {
         Position pos = Position::initial();
         std::string record;
         while (!pos.isOver()) {
-            Analysis a = analyze(pos, seconds, threads, solver, "ab");
+            Analysis a = analyze(pos, seconds, threads, solver, DEFAULT_ENGINE);
             Move m = a.items[0].move;
             record += moveToString(m) + " ";
             printf("ply %d stm %d: %s  (%s %s)\n", (int)pos.ply, (int)pos.sideToMove, moveToString(m).c_str(),

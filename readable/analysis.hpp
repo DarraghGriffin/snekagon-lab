@@ -1,6 +1,7 @@
 // "Analyse this position" as the UI, arena and selfplay use it: one list of root moves with win
 // probabilities, from whichever method fits - an exact solve of all root moves when few pieces
-// are left, otherwise the alpha-beta engine (or the old MCTS engine).
+// are left (engine "ab"), the alpha-beta engine (which in "ab2" has exact root verdicts of its
+// own), or the old MCTS engine.
 #pragma once
 #include <string>
 #include "engine.hpp"
@@ -17,7 +18,7 @@ struct Analysis {
     bool exact = false;  // all root moves solved exactly
     int value = 0;       // exact value of the position (when exact)
     int depth = 0;
-    std::string engine;  // "exact", "ab" or "mcts"
+    std::string engine;  // "exact", "ab", "ab2" or "mcts"
     std::vector<Item> items;  // best first
 };
 
@@ -81,25 +82,32 @@ inline Analysis analyzeMcts(const Position& pos, double seconds, int threads, So
     return analysis;
 }
 
-inline Analysis analyzeAlphaBeta(const Position& pos, double seconds, int threads, Solver& solver, int multipv) {
+// version 1 ("ab") first tries to solve all root moves; version 2 ("ab2") has exact root verdicts
+// of its own.
+inline Analysis analyzeAlphaBeta(const Position& pos, double seconds, int threads, Solver& solver, int multipv, int version) {
     Analysis analysis;
     auto start = std::chrono::steady_clock::now();
-    if (solveAllRootMoves(pos, seconds * 0.3, solver, analysis)) return analysis;
+    if (version == 1 && solveAllRootMoves(pos, seconds * 0.3, solver, analysis)) return analysis;
     double timeLeft = seconds - secondsSince(start);
-    EngineAnalysis result = analyzeWithEngine(pos, std::max(0.05, timeLeft), threads, multipv);
+    EngineAnalysis result = analyzeWithEngine(pos, std::max(0.05, timeLeft), threads, multipv, 64, engineVersion(version));
     for (const RootMoveResult& m : result.moves) {
         int exact = Solver::UNKNOWN;
-        if (m.exact && m.score >= WIN / 2) exact = 1;
+        if (m.verdict == Verdict::Win) exact = 1;
+        else if (m.verdict == Verdict::Draw) exact = 0;
+        else if (m.verdict == Verdict::Loss) exact = -1;
+        else if (m.exact && m.score >= WIN / 2) exact = 1;
         else if (m.score <= -WIN / 2) exact = -1;
         analysis.items.push_back({m.move, m.exact ? 1 : 0, scoreToWinProb(m.exact ? m.display : m.score), exact, m.score});
     }
     analysis.depth = result.depth;
-    analysis.engine = "ab";
+    analysis.engine = version == 2 ? "ab2" : "ab";
     return analysis;
 }
 
-// engine: "ab" (default), "abhand" (alpha-beta with the hand-made evaluation),
-// "ab:<weights file>" (alpha-beta with runtime-loaded weights) or "mcts".
+inline const char* const DEFAULT_ENGINE = "ab2";
+
+// engine: "ab2" (the default), "ab" (the first alpha-beta version), "abhand" ("ab" with the
+// hand-made evaluation), "ab:<weights file>" ("ab" with runtime-loaded weights) or "mcts".
 inline Analysis analyze(const Position& pos, double seconds, int threads, Solver& solver, const std::string& engine, int multipv = 1) {
     if (engine == "mcts") return analyzeMcts(pos, seconds, threads, solver);
     useHandMadeEval = engine == "abhand";
@@ -115,7 +123,7 @@ inline Analysis analyze(const Position& pos, double seconds, int threads, Solver
         }
         activeWeightSet = 1;
     }
-    Analysis analysis = analyzeAlphaBeta(pos, seconds, threads, solver, multipv);
+    Analysis analysis = analyzeAlphaBeta(pos, seconds, threads, solver, multipv, engine == "ab2" ? 2 : 1);
     useHandMadeEval = false;
     activeWeightSet = 0;
     return analysis;

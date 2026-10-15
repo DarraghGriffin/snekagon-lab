@@ -147,15 +147,9 @@ struct Position {
 
 // ---- results ---------------------------------------------------------------------------------
 
-// Longest red snake minus longest blue snake (> 0: red is ahead).
+// Longest red snake minus longest blue snake (> 0: red is ahead). The result of a finished game
+// as the exact solver counts it is gameResult() in solver.hpp.
 inline int redLead(const Position& pos) { return pos.longestSnake[RED] - pos.longestSnake[BLUE]; }
-
-// The result of a finished game for the side to move: +1 win, 0 draw, -1 loss.
-inline int gameResult(const Position& pos) {
-    int lead = redLead(pos);
-    int forRed = lead > 0 ? 1 : lead < 0 ? -1 : 0;
-    return pos.sideToMove == RED ? forRed : -forRed;
-}
 
 inline void initTables() {
     initBoardGeometry();
