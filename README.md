@@ -235,11 +235,24 @@ switching to the next screened move when the chosen one turns out expensive (sim
 
 ### Is a full solution feasible?
 
-Solving the centre opening (value after `1:60`) if blue wins = one blue move + all 1589 red replies, each a
-ply-3/ply-4 problem like the pilot: ~1589 × ~5.5 thread-hours × (1.5–3 overhead) ≈ **1–3·10⁴ thread-hours**,
-i.e. roughly 1–3 months of this laptop (Ryzen 7 5800H, 16 threads) running 24/7, or ~1 day on 1000 cloud
-cores. Units are independent jobs (resumable, see `results/jobs/`), so any number of machines can share the
-work.
+A proof that blue wins the game is, for each of red's 12 opening cells, one blue reply, and for every red reply
+to that, one blue answer after which every red move is a unit that blue wins. After the engine's preferred blue
+reply (4 s search), the openings leave 608-1589 red replies each, 15 259 in all; the centre leaves the most:
+
+| red's 1-hex | 5 | 6 | 7 | 16 | 17 | 18 | 27 | 28 | 38 | 39 | 49 | 60 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| red replies after blue's preferred reply | 1338 | 1329 | 1286 | 1240 | 1195 | 1217 | 1289 | 1316 | 1481 | 608 | 1371 | 1589 |
+| engine's chance for blue | 75 % | 77 % | 71 % | 63 % | 67 % | 61 % | 62 % | 70 % | 71 % | 83 % | 78 % | 59 % |
+
+Settling one red reply with `snek refute` (the winning answer and its proof) took, for ten replies to
+`1:60 4B:16,27,28,39` drawn at random, 0.06-3.7 thread-hours: 0.5-3.4 (mean 1.5) for the first four, before
+answers that won against earlier replies were tried first, and 0.06-3.7 (mean 0.84, median 0.27) for the next
+six, five of which fell to such an answer. Hard replies are the ones whose only winners rank deep in the
+evaluation's order (the stubborn `3V:40,41,50`: about 5 thread-hours, of which 4.3 to refute 1017 other moves).
+So, if blue wins, the centre line is about 1589 × (0.84-1.5) ≈ **1.3-2.4·10³ thread-hours** (3-6 days of a
+16-thread laptop, `snek proveline`), and the whole game about **1.3-2.3·10⁴ thread-hours** (1-2 months of the
+laptop, about a day on 1000 cores), plus finding blue's reply to each opening. A drawn game needs strategies for
+both sides and would cost a few times more. These are estimates from samples, not bounds.
 
 ## Distributed solve of the centre opening (`dist/`)
 
