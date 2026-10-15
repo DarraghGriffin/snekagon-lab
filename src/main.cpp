@@ -530,7 +530,7 @@ int main(int argc, char** argv) {
         int pairs = argc > 2 ? std::atoi(argv[2]) : 10;
         double secs = argc > 3 ? std::atof(argv[3]) : 1;
         int threads = argc > 4 ? std::atoi(argv[4]) : 8;
-        std::string A = argc > 5 ? argv[5] : "ab", B = argc > 6 ? argv[6] : "mcts";
+        std::string A = argc > 5 ? argv[5] : "ab2", B = argc > 6 ? argv[6] : "mcts";
         uint64_t seed = argc > 7 ? std::atoll(argv[7]) : 2024;
         int randomPlies = argc > 8 ? std::atoi(argv[8]) : 2;  // random moves at the start of each opening
         Solver solver(22);

@@ -111,7 +111,7 @@ static Analysis analyzeAb(const Pos& s, double seconds, int threads, Solver& sol
     return a;
 }
 
-static std::string g_engine = "ab";
+static std::string g_engine = "ab2";
 static Analysis analyze(const Pos& s, double seconds, int threads, Solver& solver, const std::string& engine = g_engine, int multipv = 1) {
     if (engine == "mcts") return analyzeMcts(s, seconds, threads, solver);
     g_handEval = engine == "abhand";

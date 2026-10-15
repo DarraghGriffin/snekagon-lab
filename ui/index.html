@@ -378,11 +378,12 @@ function maybeAuto() {
   if (document.getElementById('auto' + st.stm).checked) { pendingEngine = true; clearTimeout(liveTimer); setTimeout(engineMove, 50); }
 }
 function valTxt(v) { return v === 1 ? '<span class="win">win</span>' : v === -1 ? '<span class="loss">loss</span>' : '<span class="drawc">draw</span>'; }
+const isAb = (engine) => engine === 'ab' || engine === 'ab2';  // the alpha-beta engines
 function fmtScore(m) {
   if (m.exact === 1) return '<span class="win">win</span>';
   if (m.exact === -1) return '<span class="loss">loss</span>';
   if (m.exact === 0) return '<span class="drawc">draw</span>';
-  if (m.score !== undefined && lastAnalysis && lastAnalysis.engine === 'ab')
+  if (m.score !== undefined && lastAnalysis && isAb(lastAnalysis.engine))
     return (m.n ? '' : '<span class="muted">≤ </span>') + `${(m.wr * 100).toFixed(0)}%`;
   return `${(m.wr * 100).toFixed(1)}%`;
 }
@@ -397,7 +398,7 @@ function showAnalysis(a, played) {
     head = `Solved: ${valTxt(v)} for ${color}`;
     const vRed = mover === 0 ? v : -v;
     p0 = vRed === 1 ? 1 : vRed === -1 ? 0 : 0.5;
-  } else if (a.engine === 'ab') {
+  } else if (isAb(a.engine)) {
     const wr = b ? b.wr : 0.5;
     p0 = mover === 0 ? wr : 1 - wr;
     head = `Alpha-beta, depth ${a.depth}: ${b.exact === 1 ? 'a forced win' : b.exact === -1 ? 'a lost position' : fmtScore(b) + ' chance to win'} for ${color}`;
@@ -413,7 +414,7 @@ function showAnalysis(a, played) {
   const el = document.getElementById('anl');
   const note = engineNote && st && engineNote.key === posKey() ? engineNote.text + ' ' : '';
   el.innerHTML = `<div>${note}${head}</div>
-    <div class="muted">${a.engine === 'ab' ? 'The chance to win for the side to move after each move (learned evaluation + search); “≤” = only an upper bound (the move is worse than the best one).' : ''}</div>
+    <div class="muted">${isAb(a.engine) ? 'The chance to win for the side to move after each move (learned evaluation + search); “≤” = only an upper bound (the move is worse than the best one).' : ''}</div>
     <table><tr><th>#</th><th>move</th><th>value</th><th>${a.engine === 'mcts' ? 'visits' : ''}</th></tr>${rows}</table>`;
   el.querySelectorAll('tr.mv').forEach(tr => {
     const m = a.moves[+tr.dataset.k].m;
@@ -598,7 +599,7 @@ document.getElementById('bJobShow').onclick = async () => {
     const cur = await fetchJob();
     if (cur.running) { runningMoves = cur.moves; pollJob(); }
   }
-  await cmd('engine ab');  // the alpha-beta engine (the old MCTS one stays in the protocol: `engine mcts`)
+  await cmd('engine ab2');  // the alpha-beta engine with exact root verdicts (`engine ab` = without them, `engine mcts` = the first engine)
   // ?moves=1:60+4B:16,27,28,39+...  opens that position (the engine stays off for both colours)
   const pm = new URLSearchParams(location.search).get('moves');
   if (pm) {

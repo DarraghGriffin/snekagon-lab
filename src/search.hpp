@@ -255,14 +255,16 @@ inline int solveWindow(Solver& S, const Pos& s, int alpha, int beta, std::chrono
     return S.aborted ? -9 : v;
 }
 
-// The best root move is proven: a win, a draw once no move wins, or every move loses.
+// The best root move is proven: a win, a draw once no move can win, or every move loses.
 inline bool verdictsSettle(const std::vector<RootResult>& moves) {
-    bool allLost = !moves.empty();
+    bool allLost = !moves.empty(), open = false, draw = false;
     for (auto& r : moves) {
-        if (r.verdict == Verdict::Win || r.verdict == Verdict::Draw) return true;
+        if (r.verdict == Verdict::Win) return true;
         if (r.verdict != Verdict::Loss) allLost = false;
+        if (r.verdict == Verdict::Unknown) open = true;
+        if (r.verdict == Verdict::Draw) draw = true;
     }
-    return allLost;
+    return allLost || (!open && draw);
 }
 
 // Exact verdicts on the root moves, in their current order (most promising first), until the
