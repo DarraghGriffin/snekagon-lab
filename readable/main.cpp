@@ -17,10 +17,10 @@ static const std::map<std::string, Command> COMMANDS = {
     {"arena", {cmdArena, "arena [pairs] [s/move] [threads] [engineA] [engineB] [seed] [randomPlies]"}},
     {"selfplay", {cmdSelfPlay, "selfplay [games] [s/move] [threads]"}},
     // exact solving
-    {"solvepos", {cmdSolvePos, "solvepos <seconds> <threads> <move>...    (env PROGRESS=<file> to log/resume)"}},
+    {"solvepos", {cmdSolvePos, "solvepos <seconds> <threads> <move>...    (env PROGRESS=<file> to log/resume, SOLVER_WIN_TEST=1)"}},
     {"worker", {cmdWorker, "worker <coordinator[:port]> [threads] [name]   distributed solving"}},
     {"solvebench", {cmdSolveBench, "solvebench [plies] [count] [seconds] [threads]"}},
-    {"benchset", {cmdBenchSet, "benchset <file> [threads]             (env PROFILE=1 for per-ply statistics)"}},
+    {"benchset", {cmdBenchSet, "benchset <file> [threads]             (env PROFILE, BENCH_FRESH, BENCH_WINTEST, SOLVER_TT)"}},
     // checks
     {"perft", {cmdPerft, "perft [depth]                         count move sequences"}},
     {"verify", {cmdVerify, "verify [games]                        fast generator/bounds vs reference versions"}},

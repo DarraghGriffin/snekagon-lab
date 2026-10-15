@@ -1,11 +1,21 @@
 // Parallel exact solve of one position: the root moves (symmetric duplicates removed, most
 // promising first by the learned evaluation) are handed out to threads, each with its own
-// solver. Stops as soon as one move is proven to win.
+// solver. Stops as soon as one move settles the question.
 #pragma once
 #include <functional>
 #include <mutex>
 #include <thread>
 #include "solver.hpp"
+
+// What a parallel solve asks about the position. The yes/no questions are much cheaper than
+// exact values, because every child is then only a null-window test.
+enum class SolveQuestion {
+    EXACT,      // the value of every root move; stops at the first winning move
+    LOSS_TEST,  // does the side to move lose? A root move is -1, or 0 for "does not lose"; stops at
+                // the first move that does not lose
+    WIN_TEST,   // does the side to move win? A root move is 1, or 0 for "does not win"; stops at the
+                // first winning move
+};
 
 struct RootSolveResult {
     int value = Solver::UNKNOWN;  // value of the position for the side to move
@@ -21,7 +31,7 @@ using RootMoveCallback = std::function<void(Move, int value, uint64_t nodes, dou
 // Environment SOLVER_SHARED=<log2 entries>: all threads share one transposition table.
 inline RootSolveResult parallelSolve(const Position& root, double seconds, int threads, int tableLog2 = 22,
                                      const std::vector<std::pair<Move, int>>& known = {},
-                                     RootMoveCallback onResult = nullptr) {
+                                     RootMoveCallback onResult = nullptr, SolveQuestion question = SolveQuestion::EXACT) {
     auto startTime = std::chrono::steady_clock::now();
     auto elapsed = [&](std::chrono::steady_clock::time_point since) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
@@ -38,14 +48,33 @@ inline RootSolveResult parallelSolve(const Position& root, double seconds, int t
     for (size_t i = 0; i < order.size(); i++) order[i] = i;
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return promise[a] > promise[b]; });
 
+    // a root move this good settles the question
+    int enough = question == SolveQuestion::LOSS_TEST ? 0 : 1;
     std::vector<int> value(moves.size(), Solver::UNKNOWN);
     std::atomic<bool> stop{false};
     for (auto& [move, v] : known)
         for (size_t i = 0; i < moves.size(); i++)
             if (moves[i] == move) {
                 value[i] = v;
-                if (v == 1) stop = true;
+                if (v >= enough) stop = true;
             }
+
+    // The child's window, from the opponent's side: LOSS_TEST asks whether the opponent wins,
+    // WIN_TEST whether it avoids losing.
+    auto solveChild = [&](Solver& solver, const Position& child, double timeLeft) {
+        switch (question) {
+            case SolveQuestion::LOSS_TEST: {
+                int v = solver.solve(child, timeLeft, UINT64_MAX, 0, 1);
+                return v == Solver::UNKNOWN ? v : v >= 1 ? 1 : 0;
+            }
+            case SolveQuestion::WIN_TEST: {
+                int v = solver.solve(child, timeLeft, UINT64_MAX, -1, 0);
+                return v == Solver::UNKNOWN ? v : v <= -1 ? -1 : 0;
+            }
+            default:
+                return solver.solve(child, timeLeft);
+        }
+    };
 
     std::atomic<size_t> nextIndex{0};
     std::atomic<uint64_t> totalNodes{0};
@@ -67,18 +96,22 @@ inline RootSolveResult parallelSolve(const Position& root, double seconds, int t
             auto moveStart = std::chrono::steady_clock::now();
             double timeLeft = seconds - elapsed(startTime);
             if (timeLeft <= 0) break;
-            int v = solver->solve(child, timeLeft);
+            int v = solveChild(*solver, child, timeLeft);
             totalNodes += solver->nodes;
             if (v == Solver::UNKNOWN) continue;
             std::lock_guard<std::mutex> lock(resultLock);
             value[i] = -v;
-            if (-v == 1) stop = true;
+            if (-v >= enough) stop = true;
             if (onResult) onResult(moves[i], -v, solver->nodes, elapsed(moveStart));
         }
     };
-    std::vector<std::thread> pool;
-    for (int w = 0; w < threads; w++) pool.emplace_back(worker);
-    for (auto& t : pool) t.join();
+    if (threads == 1) {
+        worker();  // on this thread, so it also runs where there are no threads (the WebAssembly build of src/)
+    } else {
+        std::vector<std::thread> pool;
+        for (int w = 0; w < threads; w++) pool.emplace_back(worker);
+        for (auto& t : pool) t.join();
+    }
 
     RootSolveResult result;
     int best = -2;
@@ -88,7 +121,7 @@ inline RootSolveResult parallelSolve(const Position& root, double seconds, int t
         if (value[i] == Solver::UNKNOWN) allKnown = false;
         else best = std::max(best, value[i]);
     }
-    if (best == 1 || (allKnown && best > -2)) result.value = best;
+    if (best >= enough || (allKnown && best > -2)) result.value = best;
     result.nodes = totalNodes;
     result.seconds = elapsed(startTime);
     return result;

@@ -5,22 +5,247 @@
 //   - transposition table (transposition_table.hpp), keyed by the symmetry-canonical hash;
 //   - snake-length bounds (bounds.hpp): a position is decided as soon as one player's sure
 //     length beats the other's best possible length;
-//   - move ordering: table move, killer moves, history, simple shape heuristics and, while many
-//     pieces are left, the learned evaluation of the child positions. With only three possible
-//     values a good first move usually ends the search of a node immediately.
+//   - the last pieces: once each player has at most one piece left, the value follows from the
+//     placements without a search;
+//   - threat zones: an opponent placement that would decide the game if the opponent could play
+//     it right now has to be answered, so only our moves through its zone are searched;
+//   - move ordering: table move, killer moves, simple shape heuristics and, while many pieces are
+//     left, the learned evaluation of the child positions. With only three possible values a good
+//     first move usually ends the search of a node immediately.
+// There is no history heuristic: the scores it piled up over a long solve outweighed the shape
+// heuristics (own snake first, blocks next) and cost about 30% more nodes.
+//
+// solve() takes a window, so a yes/no question costs less than the exact value: (0, 1) asks
+// "does the side to move win?" (result 1, or <= 0), (-1, 0) "does it avoid losing?" (>= 0, or -1).
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include "evaluation.hpp"
 #include "transposition_table.hpp"
 
+// ---- the result of a finished game -----------------------------------------------------------
+
+// SOLVER_RED_BONUS=b counts b extra cells for red at the end of the game (default 0: the real
+// rules). With it, "blue still wins" means "blue wins by more than b", which finds the exact
+// winning margin of a line.
+inline const int RED_BONUS = envInt("SOLVER_RED_BONUS", 0);
+
+// `player`'s share of the red bonus: added to its own length when it is compared with the other's.
+inline int redBonusFor(int player) { return player == RED ? RED_BONUS : -RED_BONUS; }
+
+// The result of a finished game for the side to move: +1 win, 0 draw, -1 loss.
+inline int gameResult(const Position& pos) {
+    int lead = redLead(pos) + RED_BONUS;
+    int forRed = lead > 0 ? 1 : lead < 0 ? -1 : 0;
+    return pos.sideToMove == RED ? forRed : -forRed;
+}
+
+// ---- the last pieces -------------------------------------------------------------------------
+
+// Exact value of a position in which each player has at most one piece left, without a search:
+// the side to move places its piece (or passes), then the opponent makes its longest snake with
+// the placements that are still legal. A placement only ever takes opponent placements away (the
+// cells it covers, and new snakes that would now touch it), never adds any. Returns false when a
+// player has more pieces left.
+inline bool lastPiecesValue(const Position& pos, int& value) {
+    int me = pos.sideToMove, opp = me ^ 1;
+    if (pieceCount(pos.piecesLeft[me]) > 1 || pieceCount(pos.piecesLeft[opp]) > 1 || pos.ply == 0) return false;
+    int bonus = redBonusFor(me);
+    auto result = [&](int myLength, int oppLength) {
+        int lead = myLength + bonus - oppLength;
+        return lead > 0 ? 1 : lead < 0 ? -1 : 0;
+    };
+
+    // the opponent's placements that would lengthen its longest snake, longest first
+    struct Reply {
+        Bitboard blockedBy;  // any of our cells here makes the reply illegal
+        int length;
+    };
+    constexpr int MAX_REPLIES = 512;
+    Reply replies[MAX_REPLIES];
+    int replyCount = 0;
+    if (pos.piecesLeft[opp]) {
+        Position asOpponent = pos;
+        asOpponent.sideToMove = opp;
+        Bitboard occupied = pos.occupied();
+        forEachLegalMove(asOpponent, [&](Move reply) {
+            const Placement& p = reply.placement();
+            int length = longestSnakeAfter(pos, opp, p);
+            // a reply that grows an opponent snake is blocked only by covering it; a new snake
+            // also by touching it
+            if (length > pos.longestSnake[opp] && replyCount < MAX_REPLIES)
+                replies[replyCount++] = Reply{p.border & occupied ? p.cells : p.cells | p.border, length};
+        });
+        std::sort(replies, replies + replyCount, [](const Reply& a, const Reply& b) { return a.length > b.length; });
+    }
+    auto opponentLength = [&](Bitboard ourCells) {
+        for (int i = 0; i < replyCount; i++)
+            if (!(replies[i].blockedBy & ourCells)) return replies[i].length;
+        return (int)pos.longestSnake[opp];
+    };
+
+    int best = -2;  // no placement tried yet
+    if (pos.piecesLeft[me])
+        forEachLegalMove(pos, [&](Move m) {
+            if (best == 1) return;
+            const Placement& p = m.placement();
+            best = std::max(best, result(longestSnakeAfter(pos, me, p), opponentLength(p.cells)));
+        });
+    if (best == -2) best = result(pos.longestSnake[me], opponentLength(0));  // no piece or no legal placement: pass
+    value = best;
+    return true;
+}
+
+// ---- threats ---------------------------------------------------------------------------------
+//
+// An opponent placement b is a threat when, if the opponent could play b right now as a free move,
+// the snake bounds would already decide the game. Any move of ours that leaves b playable (does
+// not cover b, and does not touch b when b starts a new snake) lets the opponent answer with b,
+// and the bounds only tighten as cells fill up (our upper bound counts every cell we could still
+// use, so it covers our own move too). Such moves are therefore worth at most the bounds' verdict,
+// and only moves through the zone of every threat that is strong enough for the window need to be
+// searched (the "must-play" region of Hex solvers). Two threats with disjoint zones end a node
+// without searching any move.
+
+struct Threat {
+    Bitboard zone;  // our moves that cover none of these cells leave the threat playable
+    int value;      // upper bound on our value after every such move
+};
+
+// The threats known at one node: from the killer moves one ply down (cheap, and often the very
+// refutation) and, once the node's first move failed, from a scan of all opponent placements.
+class ThreatList {
+  public:
+    static constexpr int NO_BOUND = 2;  // boundFor(): the threats do not bound the move
+
+    int size() const { return count; }
+
+    // Upper bound on our value for a move covering `cells`.
+    int boundFor(Bitboard cells) const {
+        int bound = NO_BOUND;
+        for (int i = 0; i < count; i++)
+            if (!(cells & threats[i].zone)) bound = std::min(bound, threats[i].value);
+        return bound;
+    }
+
+    // Adds the opponent placement `placementId` (-1: none) if it is a threat. Each placement is
+    // looked at only once per node.
+    void tryPlacement(const Position& pos, int placementId) {
+        if (placementId < 0 || count >= MAX_THREATS || triedCount >= MAX_TRIED) return;
+        for (int i = 0; i < triedCount; i++)
+            if (tried[i] == placementId) return;
+        tried[triedCount++] = placementId;
+        const Placement& b = pieceTables.placements[placementId];
+        int value = threatValue(pos, b);
+        if (value <= 0) threats[count++] = Threat{threatZone(pos, b), value};
+    }
+
+    // Adds the opponent placements that are threats for the window: our value after a move that
+    // leaves them playable is at most alpha. `ours`: the clusters of the side to move, `bonus` its
+    // share of the red bonus. Cheapest tests first: a placement lowers our bound only inside the
+    // clusters it covers, so it has to cover every cluster whose bound is too high.
+    void scan(const Position& pos, const SnakeClusters& ours, int alpha, int bonus) {
+        int me = pos.sideToMove, opp = me ^ 1;
+        int myLower = pos.longestSnake[me];
+        int strict = alpha < 0 ? 1 : 0;  // a loss needs our bound strictly below the opponent's length
+        // One placement joins at most two opponent snakes (a snake is a path and the piece one
+        // segment of it), which caps the opponent's length after it; every cluster of ours with a
+        // bound above what that allows has to be covered.
+        int longest = 0, secondLongest = 0;
+        for (int j = 0; j < pos.snakeCount[opp]; j++) {
+            int length = countCells(pos.snakes[opp][j]);
+            if (length > longest) {
+                secondLongest = longest;
+                longest = length;
+            } else if (length > secondLongest) {
+                secondLongest = length;
+            }
+        }
+        int maxNeed = std::max<int>(pos.longestSnake[opp], 4 + longest + secondLongest) - bonus - strict;
+        if (myLower > maxNeed) return;
+        Bitboard mustCover = geometry.allCells;  // (no cluster above the cap: every placement)
+        for (int i = 0; i < ours.count; i++)
+            if (ours.upper[i] > maxNeed) { mustCover = ours.cells[i] & ~pos.cells[me]; break; }
+
+        Threat found[MAX_FOUND];
+        int foundCount = 0;
+        Position asOpponent = pos;
+        asOpponent.sideToMove = opp;
+        forEachLegalMoveCovering(asOpponent, mustCover, [&](Move m) {
+            if (foundCount >= MAX_FOUND) return;
+            const Placement& b = m.placement();
+            int oppLength = longestSnakeAfter(pos, opp, b);
+            int need = oppLength - bonus - strict;  // our raw upper bound must not exceed this
+            if (myLower > need) return;
+            for (int i = 0; i < ours.count; i++)
+                if (ours.upper[i] > need && !(ours.cells[i] & b.cells)) return;
+            int myUpper = upperBoundAfterBlock(pos, me, ours, myLower, b.cells) + bonus;
+            int value = myUpper < oppLength ? -1 : myUpper <= oppLength ? 0 : 1;
+            if (value <= alpha) found[foundCount++] = Threat{threatZone(pos, b), value};
+        });
+
+        // smallest zones first: a zone that contains a kept one (with a value as low) prunes nothing more
+        std::sort(found, found + foundCount, [](const Threat& a, const Threat& b) { return countCells(a.zone) < countCells(b.zone); });
+        for (int f = 0; f < foundCount && count < MAX_THREATS; f++) {
+            bool redundant = false;
+            for (int i = 0; i < count; i++)
+                if ((threats[i].zone & ~found[f].zone) == 0 && threats[i].value <= found[f].value) redundant = true;
+            if (!redundant) threats[count++] = found[f];
+        }
+    }
+
+    // The same, computing the clusters of the side to move first.
+    void scan(const Position& pos, int alpha, int bonus) {
+        SnakeClusters ours;
+        snakeBounds(pos, pos.sideToMove, &ours);
+        scan(pos, ours, alpha, bonus);
+    }
+
+  private:
+    static constexpr int MAX_THREATS = 6;  // kept per node
+    static constexpr int MAX_TRIED = 8;    // placements tried one by one per node
+    static constexpr int MAX_FOUND = 64;   // threats one scan collects before keeping the best
+    static constexpr int NOT_PLAYABLE = 2;
+    Threat threats[MAX_THREATS];
+    int count = 0;
+    int tried[MAX_TRIED];
+    int triedCount = 0;
+
+    // The cells our move has to cover to make the opponent placement b illegal.
+    static Bitboard threatZone(const Position& pos, const Placement& b) {
+        bool growsSnake = b.border & pos.cells[pos.sideToMove ^ 1];
+        return growsSnake ? b.cells : b.cells | b.border;
+    }
+
+    // What the bounds tell about our value if the opponent played b now: -1 (a loss), 0 (at most
+    // a draw) or 1 (nothing); NOT_PLAYABLE when the opponent cannot play b.
+    static int threatValue(const Position& pos, const Placement& b) {
+        int me = pos.sideToMove, opp = me ^ 1;
+        if (!hasPiece(pos.piecesLeft[opp], b.piece) || !isLegalPlacementFor(pos, opp, b)) return NOT_PLAYABLE;
+        Position after = pos;
+        after.cells[opp] |= b.cells;  // enough for our bounds (the opponent's snakes are not needed)
+        int myUpper = snakeBounds(after, me).upper + redBonusFor(me);
+        int oppLength = longestSnakeAfter(pos, opp, b);
+        return myUpper < oppLength ? -1 : myUpper <= oppLength ? 0 : 1;
+    }
+};
+
+// ---- the solver ------------------------------------------------------------------------------
+
 class Solver {
   public:
-    static constexpr int UNKNOWN = -9;  // solve() result when a time or node limit stopped it
+    static constexpr int UNKNOWN = -9;  // result when a time or node limit stopped the search
 
-    // Move-ordering settings (environment variables override them for experiments).
+    // Settings (environment variables override them for experiments).
+    bool useThreats = envInt("SOLVER_THREATS", 1) != 0;          // threat zones
+    bool scanForThreats = envInt("SOLVER_THREAT_SCAN", 1) != 0;  // ... with the scan of all opponent placements
+    bool useLastPieces = envInt("SOLVER_LAST", 1) != 0;          // exact value once each player has at most one piece
+    // Killer moves stay ahead of the evaluation ordering (the table move always does).
+    bool killersOverEval = envInt("SOLVER_KILLERS_OVER_EVAL", 1) != 0;
     int evalOrderFromPieces = envInt("SOLVER_EVAL_REM", 7);  // order by evaluation with >= this many pieces left (both players)
     // Below that, order by evaluation only where the side to move does not look lost: the losing
     // side has to try every move anyway, so ordering its moves is wasted work.
@@ -28,48 +253,95 @@ class Solver {
     double hopefulLogit = envInt("SOLVER_EVAL_WIN_THR", -100) / 100.0;
     int etcFromPieces = envInt("SOLVER_ETC_REM", 99);  // enhanced transposition cutoffs (off by default)
 
-    uint64_t nodes = 0;                        // nodes searched by the last solve()
+    uint64_t nodes = 0;                        // nodes searched since solve() (or since set to 0)
     std::atomic<bool>* stopFlag = nullptr;     // set from outside to abort the search
 
-    // Per-ply statistics (benchset with PROFILE=1): nodes visited, cut by the table, cut by the
-    // bounds, expanded.
+    // The steps of a node, for the timing profile of a build with -DSOLVER_TIMING.
+    enum Step { STEP_TABLE, STEP_LAST_PIECES, STEP_BOUNDS, STEP_KILLER_THREATS, STEP_MOVE_GENERATION, STEP_THREAT_SCAN,
+                STEP_CHILD_POSITION, NUM_STEPS };
+    static constexpr const char* STEP_NAMES[NUM_STEPS] = {"tt", "lastPieces", "bounds", "killerThreats", "movegen", "scan", "childMake"};
+
+    // Per-ply statistics (benchset with PROFILE=1).
     struct Profile {
-        uint64_t visited[16] = {}, tableCut[16] = {}, boundCut[16] = {}, expanded[16] = {};
+        uint64_t visited[16] = {}, tableCut[16] = {}, lastPieces[16] = {}, boundCut[16] = {}, expanded[16] = {};
+        uint64_t movesListed[16] = {}, threatSkipped[16] = {};  // moves listed for the search / skipped by threat zones
+        uint64_t threatScans[16] = {}, threatScansFound[16] = {};  // threat scans / scans that found a new threat
+#ifdef SOLVER_TIMING
+        uint64_t time[16] = {};                 // exclusive time of the nodes (processor cycles)
+        uint64_t stepTime[16][NUM_STEPS] = {};  // ... spent in each step
+#endif
+        void add(const Profile& other) {
+            for (int ply = 0; ply < 16; ply++) {
+                visited[ply] += other.visited[ply];
+                tableCut[ply] += other.tableCut[ply];
+                lastPieces[ply] += other.lastPieces[ply];
+                boundCut[ply] += other.boundCut[ply];
+                expanded[ply] += other.expanded[ply];
+                movesListed[ply] += other.movesListed[ply];
+                threatSkipped[ply] += other.threatSkipped[ply];
+                threatScans[ply] += other.threatScans[ply];
+                threatScansFound[ply] += other.threatScansFound[ply];
+#ifdef SOLVER_TIMING
+                time[ply] += other.time[ply];
+                for (int step = 0; step < NUM_STEPS; step++) stepTime[ply][step] += other.stepTime[ply][step];
+#endif
+            }
+        }
     } profile;
 
     // log2Entries: table size (16 bytes per entry)
     explicit Solver(int log2Entries = 22) : table(std::make_shared<TranspositionTable>(log2Entries - 1)) { init(); }
     explicit Solver(std::shared_ptr<TranspositionTable> shared) : table(std::move(shared)) { init(); }
 
-    // Forget everything learned (table, history, killers).
+    // Forget everything learned (table, killers).
     void clear() {
         table->clear();
-        for (auto& h : history) std::fill(h.begin(), h.end(), 0);
         std::memset(killers, -1, sizeof killers);
     }
 
-    // Value for the side to move (+1 / 0 / -1), or UNKNOWN when the limits stopped the search.
-    // seconds = 0: no time limit.
-    int solve(const Position& pos, double seconds = 0, uint64_t maxNodes = UINT64_MAX) {
-        aborted = false;
+    // Value for the side to move within the window (alpha, beta) - exact inside it, a bound
+    // outside - or UNKNOWN when the limits stopped the search. seconds = 0: no time limit.
+    int solve(const Position& pos, double seconds = 0, uint64_t maxNodes = UINT64_MAX, int alpha = -1, int beta = 1) {
         nodes = 0;
-        nodeLimit = maxNodes;
+        setTimeLimit(seconds);
+        return searchWithin(pos, alpha, beta, maxNodes);
+    }
+
+    // For callers that run many searches in a row (screened_win_test.hpp, the engine's root
+    // verdicts): set the time limit once, then search; `nodes` keeps counting across the searches.
+    void setTimeLimit(double seconds) {  // 0: none
         hasDeadline = seconds > 0;
-        if (hasDeadline)
-            deadline = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(seconds * 1e6));
-        int value = search(pos, -1, 1);
+        if (hasDeadline) deadline = std::chrono::steady_clock::now() + std::chrono::microseconds((long long)(seconds * 1e6));
+    }
+    void setDeadline(std::chrono::steady_clock::time_point time) {
+        hasDeadline = true;
+        deadline = time;
+    }
+    bool pastDeadline() const { return hasDeadline && std::chrono::steady_clock::now() > deadline; }
+
+    // One search with the window (alpha, beta) that stops after nodeBudget more nodes, at the
+    // deadline or when the stop flag is set: UNKNOWN then.
+    int searchWithin(const Position& pos, int alpha, int beta, uint64_t nodeBudget = UINT64_MAX) {
+        aborted = false;
+        nodeLimit = nodeBudget == UINT64_MAX ? UINT64_MAX : nodes + nodeBudget;
+        int value = search(pos, alpha, beta);
         return aborted ? UNKNOWN : value;
     }
 
   private:
     static constexpr int MAX_PLY = 32;
     static constexpr int MAX_MOVES = 3000;  // more than the legal moves of any position
+    // Ordering scores of the table move and the killer moves: above every other score.
+    static constexpr int TABLE_MOVE_SCORE = 1 << 30, KILLER1_SCORE = 1 << 29, KILLER2_SCORE = 1 << 28;
+    // The first moves are picked one at a time (most nodes are decided by their first move); once
+    // this many have failed, every move may be needed and the rest is sorted once.
+    static constexpr int FULL_SORT_AFTER = 3;
 
     std::shared_ptr<TranspositionTable> table;
-    std::vector<int32_t> history[2];  // per side and placement: how often it caused a cutoff (weighted)
-    int16_t killers[MAX_PLY][2];      // per ply: the last two moves that caused a cutoff
+    int16_t killers[MAX_PLY][2];            // per ply: the last two moves that caused a cutoff
     std::vector<Move> moveBuffer[MAX_PLY];  // per-ply move lists, allocated once
     std::vector<int> scoreBuffer[MAX_PLY];
+    std::vector<uint64_t> sortKeyBuffer[MAX_PLY];
 
     std::chrono::steady_clock::time_point deadline;
     bool hasDeadline = false;
@@ -80,8 +352,8 @@ class Solver {
         for (int i = 0; i < MAX_PLY; i++) {
             moveBuffer[i].resize(MAX_MOVES);
             scoreBuffer[i].resize(MAX_MOVES);
+            sortKeyBuffer[i].resize(MAX_MOVES);
         }
-        for (auto& h : history) h.assign(pieceTables.placements.size(), 0);
         std::memset(killers, -1, sizeof killers);
     }
 
@@ -95,14 +367,51 @@ class Solver {
         return aborted;
     }
 
+    // ---- timing (build with -DSOLVER_TIMING) ----
+
+#ifdef SOLVER_TIMING
+    // Each node charges its own time to its ply: its whole time minus that of its children.
+    uint64_t childrenTime = 0;  // time of the finished children of the node being timed
+    class NodeTimer {
+      public:
+        NodeTimer(Solver& solver, int ply)
+            : solver(solver), ply(ply), start(__builtin_ia32_rdtsc()), parentChildrenTime(solver.childrenTime) {
+            solver.childrenTime = 0;
+        }
+        ~NodeTimer() {
+            uint64_t whole = __builtin_ia32_rdtsc() - start;
+            solver.profile.time[ply] += whole - solver.childrenTime;
+            solver.childrenTime = parentChildrenTime + whole;
+        }
+
+      private:
+        Solver& solver;
+        int ply;
+        uint64_t start, parentChildrenTime;
+    };
+    template <class F>
+    void timed(Step step, int ply, F&& run) {
+        uint64_t start = __builtin_ia32_rdtsc();
+        run();
+        profile.stepTime[ply][step] += __builtin_ia32_rdtsc() - start;
+    }
+#else
+    struct NodeTimer {
+        NodeTimer(Solver&, int) {}
+    };
+    template <class F>
+    void timed(Step, int, F&& run) { run(); }
+#endif
+
     // ---- the search ----
 
     int search(const Position& pos, int alpha, int beta) {
+        int profilePly = std::min<int>(pos.ply, 15);
+        NodeTimer nodeTimer(*this, profilePly);
         nodes++;
         if (shouldAbort()) return 0;
         if (pos.isOver()) return gameResult(pos);
         uint64_t nodesAtStart = nodes;
-        int profilePly = std::min<int>(pos.ply, 15);
         profile.visited[profilePly]++;
 
         // 1. What is already known: the value lies in [lower, upper].
@@ -111,14 +420,31 @@ class Solver {
         uint64_t key = pos.canonicalKey(symmetry);
         TTEntry stored{-1, 1, -1};
         int tableMove = -1;  // the stored best move, in this position's orientation
-        if (table->probe(key, stored)) {
+        bool known;
+        timed(STEP_TABLE, profilePly, [&] { known = table->probe(key, stored); });
+        if (known) {
             lower = stored.lower;
             upper = stored.upper;
             if (lower >= upper || lower >= beta) { profile.tableCut[profilePly]++; return lower; }
             if (upper <= alpha) { profile.tableCut[profilePly]++; return upper; }
             if (stored.bestMove >= 0) tableMove = pieceTables.symmetricPlacement[stored.bestMove][geometry.inverseSymmetry[symmetry]];
         }
-        narrowByBounds(pos, lower, upper);
+
+        // 2. The last pieces: the exact value without a search.
+        if (useLastPieces) {
+            bool decided;
+            int value;
+            timed(STEP_LAST_PIECES, profilePly, [&] { decided = lastPiecesValue(pos, value); });
+            if (decided) {
+                profile.lastPieces[profilePly]++;
+                table->store(key, value, value, stored.bestMove, 0);
+                return value;
+            }
+        }
+
+        // 3. The snake-length bounds.
+        SnakeClusters myClusters;  // kept for the threat scan
+        timed(STEP_BOUNDS, profilePly, [&] { narrowByBounds(pos, lower, upper, useThreats ? &myClusters : nullptr); });
         if (lower >= upper || lower >= beta) { profile.boundCut[profilePly]++; return lower; }
         if (upper <= alpha) { profile.boundCut[profilePly]++; return upper; }
         profile.expanded[profilePly]++;
@@ -126,44 +452,99 @@ class Solver {
         beta = std::min(beta, upper);
         int alphaAtStart = alpha, betaAtStart = beta;
 
-        // 2. Generate and score the moves.
+        // 4. Threats: the opponent's refutations one ply down are the natural candidates. A move
+        //    that leaves a threat playable is worth at most the threat's value, and is skipped when
+        //    that cannot raise alpha.
+        int ply = std::min<int>(pos.ply, MAX_PLY - 1);
+        int bonus = redBonusFor(pos.sideToMove);
+        bool threatsOn = useThreats && pos.piecesLeft[pos.sideToMove ^ 1] && ply < MAX_PLY - 1;
+        ThreatList threats;
+        if (threatsOn)
+            timed(STEP_KILLER_THREATS, profilePly, [&] {
+                threats.tryPlacement(pos, killers[ply + 1][0]);
+                threats.tryPlacement(pos, killers[ply + 1][1]);
+            });
+        int skipped = -2;  // the best bound of the moves skipped because of threats
+        auto skipByThreats = [&](Move m) {
+            if (threats.size() == 0) return false;
+            int bound = threats.boundFor(m.placement().cells);
+            if (bound > alpha) return false;
+            skipped = std::max(skipped, bound);
+            profile.threatSkipped[profilePly]++;
+            return true;
+        };
+
+        // 5. Generate and score the moves.
         Move* moves = moveBuffer[pos.ply & 31].data();
         int* scores = scoreBuffer[pos.ply & 31].data();
-        int count = scoreMoves(pos, tableMove, moves, scores);
+        int count;
+        timed(STEP_MOVE_GENERATION, profilePly, [&] { count = scoreMoves(pos, tableMove, moves, scores, skipByThreats); });
         int piecesLeft = pieceCount(pos.piecesLeft[RED]) + pieceCount(pos.piecesLeft[BLUE]);
         bool orderByEval = count > 1 && (piecesLeft >= evalOrderFromPieces ||
                                          (piecesLeft >= evalOrderIfHopefulFromPieces && learnedLogit(pos) > hopefulLogit));
         bool tryEtc = count > 0 && piecesLeft >= etcFromPieces;
-        if (orderByEval || tryEtc) {
+        // Moves scored at least `ahead` (the table move, and the killers unless killersOverEval is
+        // off) stay in front of the evaluation ordering. The evaluation is expensive: when such a
+        // move exists it is searched first, and the others are evaluated only if it fails.
+        int ahead = killersOverEval ? KILLER2_SCORE : TABLE_MOVE_SCORE;
+        bool evaluateLater = false;
+        if (orderByEval && !tryEtc)
+            for (int i = 0; i < count && !evaluateLater; i++) evaluateLater = scores[i] >= ahead;
+        if (evaluateLater) orderByEval = false;
+        if (tryEtc) {
             int cutoffValue;
-            if (examineChildren(pos, moves, scores, count, orderByEval, tryEtc, beta, key, symmetry, lower, upper, cutoffValue))
-                return cutoffValue;
+            if (transpositionCutoff(pos, moves, count, beta, key, symmetry, lower, upper, cutoffValue)) return cutoffValue;
         }
+        if (orderByEval) scoreByEvaluation(pos, moves, scores, 0, count, ahead);
+        profile.movesListed[profilePly] += count;
 
-        // 3. Search the moves, best-scored first.
+        // 6. Search the moves, best-scored first.
+        bool scanned = !threatsOn || !scanForThreats;
         int best = -2, bestMove = -1;
-        if (count == 0) {
+        if (count == 0 && skipped == -2) {
             Position child = pos;
             child.play(Move::pass());
             best = -search(child, -beta, -alpha);
         } else {
             for (int i = 0; i < count; i++) {
-                bringBestToFront(moves, scores, i, count);
-                Position child = pos;
-                child.play(moves[i]);
+                if (evaluateLater && i == 1) {
+                    scoreByEvaluation(pos, moves, scores, 1, count, ahead);
+                    evaluateLater = false;
+                }
+                bringNextToFront(moves, scores, i, count, pos.ply);
+                if (skipByThreats(moves[i])) continue;
+                Position child;
+                timed(STEP_CHILD_POSITION, profilePly, [&] {
+                    child = pos;
+                    child.play(moves[i]);
+                });
                 int value = -search(child, -beta, -alpha);
                 if (aborted) return 0;
                 if (value > best) { best = value; bestMove = moves[i].placementId; }
                 if (value > alpha) alpha = value;
                 if (alpha >= beta) {
-                    rememberCutoff(pos, moves[i], i);
+                    rememberKiller(ply, moves[i]);
                     break;
                 }
+                // The refutation just found may be a threat against the remaining moves. And once
+                // the first move failed, this is probably a node where every move must be refuted,
+                // so look for all of the opponent's threats.
+                if (threatsOn && i + 2 < count) {
+                    threats.tryPlacement(pos, killers[ply + 1][0]);
+                    if (!scanned) {
+                        scanned = true;
+                        int before = threats.size();
+                        timed(STEP_THREAT_SCAN, profilePly, [&] { threats.scan(pos, myClusters, alpha, bonus); });
+                        profile.threatScans[profilePly]++;
+                        if (threats.size() > before) profile.threatScansFound[profilePly]++;
+                    }
+                }
             }
+            best = std::max(best, skipped);
         }
         if (aborted) return 0;
 
-        // 4. Store what we learned.
+        // 7. Store what we learned.
         int newLower = lower, newUpper = upper;
         if (best <= alphaAtStart) newUpper = std::min(newUpper, best);      // failed low: an upper bound
         else if (best >= betaAtStart) newLower = std::max(newLower, best);  // failed high: a lower bound
@@ -176,33 +557,37 @@ class Solver {
     }
 
     // Snake-length bounds: if my sure length beats the opponent's best possible one I have won,
-    // and so on.
-    static void narrowByBounds(const Position& pos, int& lower, int& upper) {
-        SnakeBounds me = snakeBounds(pos, pos.sideToMove);
+    // and so on. With `myClusters`, the side to move's clusters are kept there.
+    static void narrowByBounds(const Position& pos, int& lower, int& upper, SnakeClusters* myClusters) {
+        SnakeBounds me = snakeBounds(pos, pos.sideToMove, myClusters);
         SnakeBounds opp = snakeBounds(pos, pos.sideToMove ^ 1);
+        int bonus = redBonusFor(pos.sideToMove);
+        me.lower += bonus;
+        me.upper += bonus;
         int boundLower = me.lower > opp.upper ? 1 : me.lower >= opp.upper ? 0 : -1;
         int boundUpper = me.upper < opp.lower ? -1 : me.upper <= opp.lower ? 0 : 1;
         lower = std::max(lower, boundLower);
         upper = std::min(upper, boundUpper);
     }
 
-    // Generates the moves with cheap ordering scores; returns their number.
-    int scoreMoves(const Position& pos, int tableMove, Move* moves, int* scores) {
+    // Generates the moves that `skip` lets through, with cheap ordering scores; returns their number.
+    template <class Skip>
+    int scoreMoves(const Position& pos, int tableMove, Move* moves, int* scores, Skip&& skip) {
         Bitboard own = pos.ownCells(), opp = pos.opponentCells();
         Bitboard opponentFront = neighboursOf(snakeShapeOf(opp).ends) & pos.emptyCells();
         int ply = std::min<int>(pos.ply, MAX_PLY - 1);
         int killer1 = killers[ply][0], killer2 = killers[ply][1];
-        const std::vector<int32_t>& hist = history[pos.sideToMove];
         int count = 0;
         forEachLegalMove(pos, [&](Move m) {
+            if (skip(m)) return;
             const Placement& p = m.placement();
-            int score = hist[m.placementId] + PIECE_SIZE[p.piece] * 64;  // big pieces first
-            if (p.border & own) score += 256;                // grows an own snake
-            if (p.cells & opponentFront) score += 128;       // blocks an opponent snake end
-            else if (p.border & opp) score += 32;            // at least touches the opponent
-            if (m.placementId == tableMove) score = 1 << 30;
-            else if (m.placementId == killer1) score = 1 << 29;
-            else if (m.placementId == killer2) score = 1 << 28;
+            int score = PIECE_SIZE[p.piece] * 64;      // big pieces first
+            if (p.border & own) score += 256;           // grows an own snake
+            if (p.cells & opponentFront) score += 128;  // blocks an opponent snake end
+            else if (p.border & opp) score += 32;       // at least touches the opponent
+            if (m.placementId == tableMove) score = TABLE_MOVE_SCORE;
+            else if (m.placementId == killer1) score = KILLER1_SCORE;
+            else if (m.placementId == killer2) score = KILLER2_SCORE;
             moves[count] = m;
             scores[count] = score;
             count++;
@@ -210,37 +595,50 @@ class Solver {
         return count;
     }
 
-    // Plays every move once: re-scores it by the learned evaluation of the child (table and killer
-    // moves keep their priority) and/or tries an enhanced transposition cutoff (a child already
-    // known to be good enough). Returns true with cutoffValue set when the node is decided.
-    bool examineChildren(const Position& pos, Move* moves, int* scores, int count, bool orderByEval, bool tryEtc,
-                         int beta, uint64_t key, int symmetry, int lower, int upper, int& cutoffValue) {
+    // Enhanced transposition cutoff: a child already known (game over, or in the table) to be good
+    // enough for a cutoff decides the node without a search. Returns true with cutoffValue set then.
+    bool transpositionCutoff(const Position& pos, const Move* moves, int count, int beta, uint64_t key, int symmetry, int lower,
+                             int upper, int& cutoffValue) {
         for (int i = 0; i < count; i++) {
             Position child = pos;
             child.play(moves[i]);
-            if (tryEtc) {
-                int value = UNKNOWN;
-                if (child.isOver()) {
-                    value = -gameResult(child);
-                } else {
-                    int childSymmetry;
-                    TTEntry e;
-                    if (table->probe(child.canonicalKey(childSymmetry), e)) value = -e.upper;  // our value >= -upper
-                }
-                if (value >= beta) {
-                    table->store(key, std::max(lower, value), upper, pieceTables.symmetricPlacement[moves[i].placementId][symmetry], 0);
-                    cutoffValue = value;
-                    return true;
-                }
+            int value = UNKNOWN;
+            if (child.isOver()) {
+                value = -gameResult(child);
+            } else {
+                int childSymmetry;
+                TTEntry e;
+                if (table->probe(child.canonicalKey(childSymmetry), e)) value = -e.upper;  // our value >= -upper
             }
-            if (orderByEval && scores[i] < (1 << 28))
-                scores[i] = child.isOver() ? -gameResult(child) * 100000 : -(int)(1000 * learnedLogit(child));
+            if (value >= beta) {
+                table->store(key, std::max(lower, value), upper, pieceTables.symmetricPlacement[moves[i].placementId][symmetry], 0);
+                cutoffValue = value;
+                return true;
+            }
         }
         return false;
     }
 
-    // Selection sort step: moves the best-scored of moves[i..count) to position i. (Usually only
-    // the first move or two are ever searched, so sorting everything up front would be wasted.)
+    // Re-scores moves[from..count) by the learned evaluation of the child position, except the
+    // moves scored at least `ahead`: they keep their place in front.
+    static void scoreByEvaluation(const Position& pos, const Move* moves, int* scores, int from, int count, int ahead) {
+        for (int i = from; i < count; i++)
+            if (scores[i] < ahead) {
+                Position child = pos;
+                child.play(moves[i]);
+                scores[i] = child.isOver() ? -gameResult(child) * 100000 : -(int)(1000 * learnedLogit(child));
+            }
+    }
+
+    // Puts the move to search next at position i: the best-scored of the rest, picked one at a
+    // time for the first FULL_SORT_AFTER moves, then from a sort of the rest at once.
+    void bringNextToFront(Move* moves, int* scores, int i, int count, int ply) {
+        if (i < FULL_SORT_AFTER) bringBestToFront(moves, scores, i, count);
+        else if (i == FULL_SORT_AFTER) sortByScore(moves, scores, i, count, sortKeyBuffer[ply & 31].data());
+    }
+
+    // Selection sort step: moves the best-scored of moves[i..count) to position i (the earlier
+    // move on ties).
     static void bringBestToFront(Move* moves, int* scores, int i, int count) {
         int best = i;
         for (int j = i + 1; j < count; j++)
@@ -249,9 +647,19 @@ class Solver {
         std::swap(scores[i], scores[best]);
     }
 
-    void rememberCutoff(const Position& pos, Move m, int moveNumber) {
-        history[pos.sideToMove][m.placementId] += 1 + moveNumber / 8 + 4 * pos.ply;
-        int ply = std::min<int>(pos.ply, MAX_PLY - 1);
+    // Sorts moves[from..count) by score, best first, and equal scores by placement id, highest
+    // first. Score and id are packed into one integer (the score with its sign bit flipped, so
+    // that unsigned order is signed order), which makes the order independent of the sort.
+    static void sortByScore(Move* moves, int* scores, int from, int count, uint64_t* keys) {
+        for (int j = from; j < count; j++) keys[j] = uint64_t(uint32_t(scores[j]) ^ 0x80000000u) << 16 | uint16_t(moves[j].placementId);
+        std::sort(keys + from, keys + count, std::greater<uint64_t>());
+        for (int j = from; j < count; j++) {
+            moves[j].placementId = int16_t(keys[j] & 0xFFFF);
+            scores[j] = int(uint32_t(keys[j] >> 16) ^ 0x80000000u);
+        }
+    }
+
+    void rememberKiller(int ply, Move m) {
         if (killers[ply][0] != m.placementId) {
             killers[ply][1] = killers[ply][0];
             killers[ply][0] = m.placementId;
