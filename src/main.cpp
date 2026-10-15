@@ -371,7 +371,7 @@ int main(int argc, char** argv) {
             }
         }
         FILE* log = fopen(logPath.c_str(), "a");
-        // attacker moves, its best first by the evaluation
+        // attacker moves, its best first by the evaluation (the search's favourites before them)
         std::vector<Move> all = uniqueRootMoves(s);
         std::vector<std::pair<double, Move>> ranked;
         for (Move m : all) {
@@ -379,6 +379,22 @@ int main(int argc, char** argv) {
             ranked.push_back({c.over() ? Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});
         }
         std::stable_sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
+        // a short engine search puts its best moves first: it ranks easy winners far higher than the
+        // evaluation alone does (REFUTE_SEARCH seconds, default 2; 0 = the evaluation's order only)
+        int searchSecs = envInt("REFUTE_SEARCH", 2);
+        if (searchSecs > 0 && ranked.size() > 1) {
+            constexpr int SEARCH_TOP = 8;
+            AbAnalysis an = abAnalyze(s, searchSecs, threads, SEARCH_TOP);
+            std::vector<std::pair<double, Move>> front, rest;
+            for (size_t i = 0; i < an.moves.size() && (int)i < SEARCH_TOP; i++) front.push_back({0.0, an.moves[i].mv});
+            for (auto& r : ranked) {
+                bool inFront = false;
+                for (auto& f : front) inFront |= f.second == r.second;
+                if (!inFront) rest.push_back(r);
+            }
+            ranked = front;
+            ranked.insert(ranked.end(), rest.begin(), rest.end());
+        }
         std::vector<Move> todo;
         for (auto& [sc, m] : ranked) if (!status.count(moveStr(m))) todo.push_back(m);
         printf("%zu attacker moves, %zu settled earlier\n", all.size(), all.size() - todo.size());
