@@ -459,10 +459,15 @@ struct Solver {
     }
 };
 
+enum SolveQuestion { EXACT, LOSS_TEST, WIN_TEST };
 // Parallel exact solve: root moves (symmetry-reduced, ordered by the learned
 // evaluation) are distributed over threads, each with its own solver/TT. Stops
 // as soon as a winning move is found. perMove receives the value of every root
 // move for the side to move (-9 = unknown).
+// question: EXACT values, or only whether the side to move loses (LOSS_TEST: every child is
+// a win test for the opponent; a root move is -1, or 0 for "does not lose"; stops at the first
+// move that does not lose) or wins (WIN_TEST: a root move is 1, or 0 for "does not win"; stops
+// at the first winning move). The yes/no questions are much cheaper than exact values.
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -476,7 +481,8 @@ struct ParallelSolveResult {
 // onResult: called (under a lock) for every newly solved root move.
 inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int threads, int ttLog2 = 22,
                                          const std::vector<std::pair<Move, int>>& known = {},
-                                         std::function<void(Move, int, uint64_t, double)> onResult = nullptr) {
+                                         std::function<void(Move, int, uint64_t, double)> onResult = nullptr,
+                                         SolveQuestion question = EXACT) {
     auto t0 = std::chrono::steady_clock::now();
     ParallelSolveResult res;
     std::vector<Move> all, mv;
@@ -498,9 +504,10 @@ inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int th
     std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return ord[a] > ord[b]; });
     std::vector<int> val(mv.size(), -9);
     std::atomic<bool> stop{false};
+    int enough = question == LOSS_TEST ? 0 : 1;  // a root move this good settles the root
     for (auto& [m, v] : known)
         for (size_t i = 0; i < mv.size(); i++)
-            if (mv[i] == m) { val[i] = v; if (v == 1) stop = true; }
+            if (mv[i] == m) { val[i] = v; if (v >= enough) stop = true; }
     std::atomic<size_t> next{0};
     std::atomic<uint64_t> nodes{0};
     std::mutex mu;
@@ -522,12 +529,17 @@ inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int th
             auto ts = std::chrono::steady_clock::now();
             double left = seconds - std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (left <= 0) break;
-            int v = S.solve(c, left);
+            // child windows: LOSS_TEST asks whether the opponent wins, WIN_TEST whether it avoids losing
+            int v = question == LOSS_TEST ? S.solve(c, left, UINT64_MAX, 0, 1)
+                    : question == WIN_TEST ? S.solve(c, left, UINT64_MAX, -1, 0)
+                                           : S.solve(c, left);
             nodes += S.nodes;
             if (v == -9) continue;
+            if (question == LOSS_TEST) v = v >= 1 ? 1 : 0;
+            if (question == WIN_TEST) v = v <= -1 ? -1 : 0;
             std::lock_guard<std::mutex> lk(mu);
             val[i] = -v;
-            if (-v == 1) stop = true;
+            if (-v >= enough) stop = true;
             if (onResult) onResult(mv[i], -v, S.nodes, std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count());
         }
     };
@@ -542,7 +554,7 @@ inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int th
         res.perMove.push_back({mv[i], val[i]});
         if (val[i] == -9) allKnown = false; else best = std::max(best, val[i]);
     }
-    if (best == 1 || (allKnown && best > -2)) res.value = best;
+    if (best >= enough || (allKnown && best > -2)) res.value = best;
     res.nodes = nodes;
     res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return res;

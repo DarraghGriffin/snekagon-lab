@@ -4,10 +4,13 @@
 //   snek solvebench <plies> <count> [seconds] [threads]
 //                              solve random positions after <plies> random moves
 //   snek selfplay <games> <seconds/move>
+//   snek refute <threads> <log> <moves...>
+//                              show that the side to move cannot win (see README)
 #include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -290,6 +293,10 @@ int main(int argc, char** argv) {
         }
         // env PROGRESS=<file>: append every solved root move ("<move> <win|draw|loss> <nodes> <sec>")
         // and, if the file exists, skip the moves already recorded there (resume).
+        // env SOLVER_WIN_TEST=1: only prove or refute that the side to move loses (each root move is
+        // "loss" or "notloss"; stops at the first move that does not lose) - much cheaper.
+        bool lossTest = envInt("SOLVER_WIN_TEST", 0) != 0;
+        SolveQuestion question = lossTest ? LOSS_TEST : EXACT;
         std::vector<std::pair<Move, int>> prev;
         FILE* prog = nullptr;
         if (const char* pf = getenv("PROGRESS")) {
@@ -299,7 +306,7 @@ int main(int argc, char** argv) {
             while (std::getline(in, line)) {
                 std::istringstream ls(line);
                 Move m;
-                if (ls >> ms >> vs && parseMove(ms, m)) prev.push_back({m, vs == "win" ? 1 : vs == "loss" ? -1 : 0});
+                if (ls >> ms >> vs && parseMove(ms, m)) prev.push_back({m, vs == "win" ? 1 : vs == "loss" ? -1 : 0});  // notloss: 0
             }
             if (!prev.empty()) printf("resuming: %zu root moves already solved\n", prev.size());
             prog = fopen(pf, "a");
@@ -310,19 +317,150 @@ int main(int argc, char** argv) {
         size_t done = prev.size();
         auto r = parallelSolve(s, secs, threads, 22, prev, [&](Move m, int v, uint64_t nodes, double sec) {
             done++;
-            const char* vs = v > 0 ? "win" : v < 0 ? "loss" : "draw";
+            const char* vs = v > 0 ? "win" : v < 0 ? "loss" : lossTest ? "notloss" : "draw";
             if (prog) { fprintf(prog, "%s %s %llu %.1f\n", moveStr(m).c_str(), vs, (unsigned long long)nodes, sec); fflush(prog); }
             double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             printf("[%6.0fs] %4zu solved  %-22s %-4s %6.1fs %12llu nodes\n", el, done, moveStr(m).c_str(), vs, sec, (unsigned long long)nodes);
             fflush(stdout);
-        });
+        }, question);
         if (prog) fclose(prog);
         int known = 0;
         for (auto& pm : r.perMove) known += pm.second != -9;
         printf("ply %d stm %d: value %s  (%d/%zu root moves solved, %llu nodes, %.1fs)\n", (int)s.ply, (int)s.stm,
                r.value == -9 ? "unknown" : std::to_string(r.value).c_str(), known, r.perMove.size(), (unsigned long long)r.nodes, r.seconds);
         for (auto& pm : r.perMove)
-            if (pm.second != -9) printf("  %-22s %s\n", moveStr(pm.first).c_str(), pm.second > 0 ? "win" : pm.second < 0 ? "loss" : "draw");
+            if (pm.second != -9)
+                printf("  %-22s %s\n", moveStr(pm.first).c_str(), pm.second > 0 ? "win" : pm.second < 0 ? "loss" : lossTest ? "notloss" : "draw");
+    } else if (mode == "refute") {
+        // snek refute <threads> <log> <moves...>: show that the side to move (the attacker) cannot win.
+        // For every attacker move, look for a defender reply after which the attacker does not win
+        // (a win test of that unit); with REFUTE_LOSS=1, one after which the attacker loses (shows
+        // that the attacker loses). Pass 1: defender replies that refuted other moves first, then the
+        // defender's best replies by the evaluation, at most REFUTE_TRIES (12) tries of REFUTE_NODES
+        // (60M) nodes each, attacker moves spread over threads. Pass 2, for the moves pass 1 left open:
+        // every defender reply, most promising first, with SOLVER_WIN_TEST-style parallelSolve - either
+        // a refutation or a proof that the move wins. Log lines (resumable; every refutation is a
+        // position anyone can re-solve): "<move> refuted <reply> <nodes> <sec>", "<move> open",
+        // "<move> wins".
+        if (argc < 5) { printf("usage: snek refute <threads> <log> <moves...>\n"); return 1; }
+        int threads = std::atoi(argv[2]);
+        std::string logPath = argv[3];
+        int maxTries = envInt("REFUTE_TRIES", 12);
+        bool mustLose = envInt("REFUTE_LOSS", 0) != 0;
+        uint64_t budget = (uint64_t)envInt("REFUTE_NODES", 60) * 1000000;
+        Pos s = Pos::start();
+        for (int i = 4; i < argc; i++) {
+            Move m;
+            if (!parseMove(argv[i], m) || !s.legalMove(m)) { printf("illegal move %s\n", argv[i]); return 1; }
+            s.play(m);
+        }
+        std::map<std::string, std::string> status;  // attacker move -> refuted / open / wins
+        std::map<int, int> killers;                 // defender reply -> refutations so far
+        {
+            std::ifstream in(logPath);
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                std::string m, st, r;
+                if (!(ls >> m >> st)) continue;
+                status[m] = st;
+                Move rm;
+                if (st == "refuted" && ls >> r && parseMove(r, rm)) killers[rm.gid]++;
+            }
+        }
+        FILE* log = fopen(logPath.c_str(), "a");
+        std::vector<Move> all = uniqueRootMoves(s);
+        std::vector<std::pair<double, Move>> todo;
+        for (Move m : all) {
+            if (status.count(moveStr(m))) continue;
+            Pos c = s; c.play(m);
+            todo.push_back({c.over() ? Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});
+        }
+        std::sort(todo.begin(), todo.end(), [](auto& a, auto& b) { return a.first > b.first; });  // attacker's best first
+        printf("%zu attacker moves, %zu settled earlier\n", all.size(), all.size() - todo.size());
+        fflush(stdout);
+        std::mutex mu;
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> th;
+        for (int w = 0; w < threads; w++)
+            th.emplace_back([&] {
+                Solver S(22);
+                for (;;) {
+                    size_t k = next++;
+                    if (k >= todo.size()) break;
+                    Move m = todo[k].second;
+                    Pos a = s; a.play(m);
+                    std::vector<Move> replies;
+                    a.genMoves(replies);
+                    std::vector<std::pair<double, Move>> order;
+                    {
+                        std::lock_guard<std::mutex> lk(mu);
+                        for (Move r : replies) {
+                            auto it = killers.find(r.gid);
+                            Pos c = a; c.play(r);  // attacker to move in c: a low attacker logit is good for the defender
+                            double sc = it != killers.end() ? 1000.0 + it->second : c.over() ? -1000.0 * Solver::terminalValue(c) : -learnedLogit(c);
+                            order.push_back({sc, r});
+                        }
+                    }
+                    std::sort(order.begin(), order.end(), [](auto& x, auto& y) { return x.first > y.first; });
+                    bool refuted = false;
+                    for (int t = 0; t < maxTries && t < (int)order.size() && !refuted; t++) {
+                        Pos u = a; u.play(order[t].second);
+                        S.clear();
+                        auto ts = std::chrono::steady_clock::now();
+                        // does the attacker win (avoid losing, with REFUTE_LOSS) after this reply?
+                        int v = mustLose ? S.solve(u, 0, budget, -1, 0) : S.solve(u, 0, budget, 0, 1);
+                        if (v == -9 || (mustLose ? v >= 0 : v >= 1)) continue;
+                        double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+                        std::lock_guard<std::mutex> lk(mu);
+                        killers[order[t].second.gid]++;
+                        fprintf(log, "%s refuted %s %llu %.1f\n", moveStr(m).c_str(), moveStr(order[t].second).c_str(), (unsigned long long)S.nodes, sec);
+                        fflush(log);
+                        refuted = true;
+                    }
+                    std::lock_guard<std::mutex> lk(mu);
+                    status[moveStr(m)] = refuted ? "refuted" : "open";
+                    if (!refuted) { fprintf(log, "%s open\n", moveStr(m).c_str()); fflush(log); }
+                    printf("%zu/%zu %s %s\n", k + 1, todo.size(), moveStr(m).c_str(), refuted ? "refuted" : "open");
+                    fflush(stdout);
+                }
+            });
+        for (auto& t : th) t.join();
+        // pass 2: the defender's whole reply list for the open moves; the first move the defender
+        // cannot refute settles the question
+        const char* survives = mustLose ? "holds" : "wins";
+        std::string survivor;
+        for (Move m : all) {
+            std::string ms = moveStr(m);
+            if (status[ms] == survives) survivor = ms;
+            if (!survivor.empty()) break;
+            if (status[ms] != "open") continue;
+            Pos a = s; a.play(m);
+            // does the defender lose (or, with REFUTE_LOSS, fail to win)?
+            auto r = parallelSolve(a, 1e9, threads, 22, {}, nullptr, mustLose ? WIN_TEST : LOSS_TEST);
+            int refuting = mustLose ? 1 : 0;  // a defender reply this good refutes the move
+            if (r.value != -9 && r.value < refuting) {
+                status[ms] = survives;
+                survivor = ms;
+                fprintf(log, "%s %s\n", ms.c_str(), survives);
+            }
+            for (auto& [rm, v] : r.perMove)
+                if (r.value == refuting && v == refuting) {
+                    status[ms] = "refuted";
+                    fprintf(log, "%s refuted %s\n", ms.c_str(), moveStr(rm).c_str());
+                    break;
+                }
+            fflush(log);
+            printf("pass 2: %s %s\n", ms.c_str(), status[ms].c_str());
+            fflush(stdout);
+        }
+        fclose(log);
+        size_t refutedCount = 0;
+        for (Move m : all) refutedCount += status[moveStr(m)] == "refuted";
+        if (!survivor.empty()) printf("the side to move %s with %s\n", mustLose ? "does not lose" : "WINS", survivor.c_str());
+        else if (refutedCount == all.size())
+            printf("the side to move %s: all %zu moves refuted\n", mustLose ? "LOSES" : "cannot win", all.size());
+        else printf("%zu of %zu moves refuted, rest unknown\n", refutedCount, all.size());
     } else if (mode == "worker") {
         // snek worker <host[:port]> [threads] [name]
         if (argc < 3) { printf("usage: snek worker <coordinator-ip[:port]> [threads] [name]\n"); return 1; }
