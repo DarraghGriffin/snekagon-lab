@@ -8,6 +8,8 @@
 //   coordinator -> worker:  unit <id> [<node budget>] <move> <move> ...  (0..n of them, then)
 //                           (value -9 is returned when the node budget runs out)
 //                           end
+// With SOLVER_WIN_TEST=1 the worker only asks whether the side to move wins (cheaper): a unit
+// that is not a win comes back as 0 (draw or loss) or -1 (proven loss) instead of its exact value.
 // A worker that loses the connection reconnects; the coordinator re-queues its units.
 #pragma once
 #include <condition_variable>
@@ -102,6 +104,7 @@ inline int runWorker(const std::string& hostport, int threads, const std::string
     for (int w = 0; w < threads; w++)
         th.emplace_back([&] {
             Solver S(22);
+            bool winTest = envInt("SOLVER_WIN_TEST", 0) != 0;
             for (;;) {
                 std::pair<std::string, std::string> u;
                 {
@@ -129,7 +132,7 @@ inline int runWorker(const std::string& hostport, int threads, const std::string
                     snprintf(line, sizeof line, "result %s bad 0 0", u.first.c_str());
                 } else {
                     auto ts = std::chrono::steady_clock::now();
-                    int v = S.solve(s, 0, limit ? limit : UINT64_MAX);  // -9 = budget exceeded
+                    int v = S.solve(s, 0, limit ? limit : UINT64_MAX, winTest ? 0 : -1, 1);  // -9 = budget exceeded
                     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
                     snprintf(line, sizeof line, "result %s %d %llu %.2f", u.first.c_str(), v, (unsigned long long)S.nodes, sec);
                     solvedCount++;
