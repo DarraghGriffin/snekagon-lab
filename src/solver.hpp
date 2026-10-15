@@ -51,6 +51,9 @@ inline int envInt(const char* name, int def) { const char* v = getenv(name); ret
 // With it, "blue still wins" means blue wins by more than b: used to find the exact margin of a line.
 inline const int RED_BONUS = envInt("SOLVER_RED_BONUS", 0);
 
+enum { PART_TT, PART_LAST, PART_BOUNDS, PART_KILLER_THREATS, PART_MOVEGEN, PART_SCAN, PART_CHILD, NPART };
+inline const char* PART_NAMES[NPART] = {"tt", "lastPieces", "bounds", "killerThreats", "movegen", "scan", "childMake"};
+
 struct Solver {
     std::shared_ptr<LTT> tt;
     std::vector<int32_t> hist[2];
@@ -79,8 +82,10 @@ struct Solver {
     explicit Solver(std::shared_ptr<LTT> shared) : tt(std::move(shared)) { init(); }
     std::vector<Move> mvBuf[32];
     std::vector<int> scBuf[32];
+    std::vector<uint64_t> sortBuf[32];
+    static constexpr int FULL_SORT_AFTER = 3;
     void init() {
-        for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); scBuf[i].resize(3000); }
+        for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); scBuf[i].resize(3000); sortBuf[i].resize(3000); }
         for (auto& h : hist) h.assign(T.NGID, 0);
         std::memset(killer, -1, sizeof killer);
     }
@@ -145,18 +150,33 @@ struct Solver {
         int lbMe, ubMe;
         snakeClusters(s, me, lbMe, ubMe, cl);
         int strict = alpha < 0 ? 1 : 0;  // a loss needs our bound strictly below the opponent
+        // a placement joins at most two snakes (it is one segment of a path), which caps what
+        // the opponent can reach, and every cluster above that cap must be covered
+        int top[2] = {0, 0};
+        for (int j = 0; j < s.ncomp[opp]; j++) {
+            int len = popc(s.comp[opp][j]);
+            if (len > top[0]) { top[1] = top[0]; top[0] = len; }
+            else if (len > top[1]) top[1] = len;
+        }
+        int maxNeed = std::max<int>(s.L[opp], 4 + top[0] + top[1]) - bonus - strict;
+        if (lbMe > maxNeed) return;
+        BB mustCover = ~(BB)0;
+        for (int i = 0; i < cl.n; i++)
+            if (cl.ub[i] > maxNeed) { mustCover = cl.cells[i] & ~s.own[me]; break; }
         Threat found[MAX_FOUND];
         int nf = 0;
         Pos asOpp = s;
         asOpp.stm = (uint8_t)opp;
-        asOpp.forEachLegal([&](Move b) {
+        asOpp.forEachLegalTouching(mustCover, [&](Move b) {
             if (nf >= MAX_FOUND) return;
             const Placement& pl = b.pl();
-            int need = lengthAfter(s, opp, pl) - bonus - strict;  // our raw upper bound must not exceed this
+            int lenOpp = lengthAfter(s, opp, pl);
+            int need = lenOpp - bonus - strict;  // our raw upper bound must not exceed this
             if (lbMe > need) return;
             for (int i = 0; i < cl.n; i++)
                 if (cl.ub[i] > need && !(cl.cells[i] & pl.m)) return;
-            int v = threatValue(s, pl, b.piece());
+            int ub = boundAfterBlock(s, me, cl, lbMe, pl.m) + bonus;
+            int v = ub < lenOpp ? -1 : ub <= lenOpp ? 0 : 1;
             if (v <= alpha) found[nf++] = Threat{threatZone(s, pl), v};
         });
         std::sort(found, found + nf, [](const Threat& a, const Threat& b) { return popc(a.zone) < popc(b.zone); });
@@ -226,7 +246,29 @@ struct Solver {
         return aborted;
     }
 
+#ifdef SOLVER_TIMING
+    // exclusive time per ply (build with -DSOLVER_TIMING): each node charges its own time
+    // minus the time of its children; pPart splits it into the steps named in PART_NAMES
+    uint64_t pTime[16] = {}, childTime = 0, pPart[16][NPART] = {};
+    struct PlyTimer {
+        Solver& S; int pp; uint64_t t0, savedChild;
+        PlyTimer(Solver& s_, int p) : S(s_), pp(p), t0(__builtin_ia32_rdtsc()), savedChild(s_.childTime) { S.childTime = 0; }
+        ~PlyTimer() {
+            uint64_t incl = __builtin_ia32_rdtsc() - t0;
+            S.pTime[pp] += incl - S.childTime;
+            S.childTime = savedChild + incl;
+        }
+    };
+#endif
+#ifdef SOLVER_TIMING
+#define TIMED(part, stmt) do { uint64_t t_ = __builtin_ia32_rdtsc(); stmt; pPart[pp][part] += __builtin_ia32_rdtsc() - t_; } while (0)
+#else
+#define TIMED(part, stmt) do { stmt; } while (0)
+#endif
     int search(const Pos& s, int alpha, int beta) {
+#ifdef SOLVER_TIMING
+        PlyTimer timer(*this, std::min<int>(s.ply, 15));
+#endif
         nodes++;
         if (checkAbort()) return 0;
         if (s.over()) return terminalValue(s);
@@ -238,14 +280,17 @@ struct Solver {
         int t;
         uint64_t k = s.key(t);
         int ttMove = -1, eLo, eHi, eBest = -1;
-        if (tt->probe(k, eLo, eHi, eBest)) {
+        bool hit;
+        TIMED(PART_TT, hit = tt->probe(k, eLo, eHi, eBest));
+        if (hit) {
             lo = eLo; hi = eHi;
             if (lo >= hi || lo >= beta) { pTT[pp]++; return lo; }
             if (hi <= alpha) { pTT[pp]++; return hi; }
             if (eBest >= 0) ttMove = T.gidSym[eBest][T.inv[t]];
         }
         if (useLastPieces) {
-            int v = lastPieces(s);
+            int v;
+            TIMED(PART_LAST, v = lastPieces(s));
             if (v != -2) {
                 pLast[pp]++;
                 tt->store(k, v, v, eBest, 0);
@@ -254,8 +299,7 @@ struct Solver {
         }
         // snake-length bound cutoffs
         int lbMe, ubMe, lbOp, ubOp;
-        snakeBounds(s, s.stm, lbMe, ubMe);
-        snakeBounds(s, s.stm ^ 1, lbOp, ubOp);
+        TIMED(PART_BOUNDS, snakeBounds(s, s.stm, lbMe, ubMe); snakeBounds(s, s.stm ^ 1, lbOp, ubOp));
         int bonus = s.stm == 0 ? RED_BONUS : -RED_BONUS;  // the side to move's share of SOLVER_RED_BONUS
         lbMe += bonus;
         ubMe += bonus;
@@ -287,9 +331,12 @@ struct Solver {
         int skipped = -2;  // best bound of the moves skipped because of threats
         bool threatsOn = useThreats && s.avail[s.stm ^ 1] && ply < 31;
         if (threatsOn) {
-            addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
-            addThreat(s, killer[ply + 1][1], threats, nThreats, tried, nTried);
+            TIMED(PART_KILLER_THREATS, addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
+                                       addThreat(s, killer[ply + 1][1], threats, nThreats, tried, nTried));
         }
+#ifdef SOLVER_TIMING
+        uint64_t genT0 = __builtin_ia32_rdtsc();
+#endif
         bool scanned = !threatsOn || !threatScan;
         s.forEachLegal([&](Move m) {
             const Placement& pl = m.pl();
@@ -306,6 +353,9 @@ struct Solver {
             else if (m.gid == k2) sc = 1 << 28;
             moves[n] = m; score[n] = sc; n++;
         });
+#ifdef SOLVER_TIMING
+        pPart[pp][PART_MOVEGEN] += __builtin_ia32_rdtsc() - genT0;
+#endif
         int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
         bool doEval = n > 1 && (rem >= evalOrderRem || (rem >= evalOrderRemWin && learnedLogit(s) > evalWinThreshold));
         bool doEtc = n > 0 && rem >= etcRem;
@@ -334,15 +384,22 @@ struct Solver {
             best = -search(c, -beta, -alpha);
         } else {
             for (int i = 0; i < n; i++) {
-                int bi = i;
-                for (int j = i + 1; j < n; j++) if (score[j] > score[bi]) bi = j;
-                std::swap(moves[i], moves[bi]); std::swap(score[i], score[bi]);
+                if (i < FULL_SORT_AFTER) {  // pick the best remaining move: most nodes cut on the first one
+                    int bi = i;
+                    for (int j = i + 1; j < n; j++) if (score[j] > score[bi]) bi = j;
+                    std::swap(moves[i], moves[bi]); std::swap(score[i], score[bi]);
+                } else if (i == FULL_SORT_AFTER) {  // every move may be needed: sort the rest once
+                    uint64_t* keys = sortBuf[s.ply & 31].data();
+                    for (int j = i; j < n; j++) keys[j] = uint64_t(uint32_t(score[j]) ^ 0x80000000u) << 16 | uint16_t(moves[j].gid);
+                    std::sort(keys + i, keys + n, std::greater<uint64_t>());
+                    for (int j = i; j < n; j++) { moves[j].gid = int16_t(keys[j] & 0xFFFF); score[j] = int(uint32_t(keys[j] >> 16) ^ 0x80000000u); }
+                }
                 if (nThreats) {
                     int tb = threatBound(moves[i].pl().m, threats, nThreats);
                     if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; continue; }
                 }
-                Pos c = s;
-                c.play(moves[i]);
+                Pos c;
+                TIMED(PART_CHILD, c = s; c.play(moves[i]));
                 int v = -search(c, -beta, -alpha);
                 if (aborted) return 0;
                 if (v > best) { best = v; bestGid = moves[i].gid; }
@@ -357,7 +414,7 @@ struct Solver {
                 // look for all the opponent's threats
                 if (threatsOn && i + 2 < n) {
                     addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
-                    if (!scanned) { scanned = true; scanThreats(s, alpha, bonus, threats, nThreats); }
+                    if (!scanned) { scanned = true; TIMED(PART_SCAN, scanThreats(s, alpha, bonus, threats, nThreats)); }
                 }
             }
             best = std::max(best, skipped);

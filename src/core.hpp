@@ -410,7 +410,12 @@ struct Pos {
         g.meDeg1 = sh.own & sh.ge1;
     }
     template <class F>
-    void forEachLegal(F&& f) const {
+    void forEachLegal(F&& f) const { forEachLegalImpl<false>(0, f); }
+    // only the legal placements covering at least one cell of `touch`
+    template <class F>
+    void forEachLegalTouching(BB touch, F&& f) const { forEachLegalImpl<true>(touch, f); }
+    template <bool Touching, class F>
+    void forEachLegalImpl(BB touch, F&& f) const {
         uint8_t av = movable();
         if (!av) return;
         GenCtx g;
@@ -420,6 +425,11 @@ struct Pos {
             for (int o = T.orBegin[p]; o < T.orBegin[p + 1]; o++) {
                 const Orient& od = T.OR[o];
                 BB lg = orientLegal(od, g);
+                if (Touching && lg) {
+                    BB anchors = 0;
+                    for (int k = 0; k < od.n; k++) anchors |= shiftFrom(touch, od.dq[k], od.dr[k]);
+                    lg &= anchors;
+                }
                 while (lg) { int a = lsb(lg); lg &= lg - 1; f(Move{od.gidAt[a]}); }
             }
         }
@@ -507,15 +517,11 @@ struct Clusters {
     BB cells[NCELLS];  // growable cells and own snakes of the cluster
     int ub[NCELLS];    // upper bound of a final snake inside the cluster
 };
+// Upper bound (at least lb) of the final snake of a player with pieces av, snakes comps and
+// growable cells G, cluster by cluster as described above.
 template <bool Record>
-inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out) {
-    lb = s.L[c];
+inline int clusterBound(BB G, const BB* comps, int ncomp, uint8_t av, int lb, Clusters* out) {
     if (Record) out->n = 0;
-    uint8_t av = s.avail[c];
-    if (!av) { ub = lb; return; }
-    BB me = s.own[c];
-    Shape sh = shapeOf(me);
-    BB G = s.empty() & ~expand(sh.full);
     // clusters = growable regions joined through the snakes touching them. Regions are
     // compact blobs (cheap floods); snakes are attached by adjacency, never flooded.
     BB cl[NCELLS];
@@ -526,8 +532,8 @@ inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out
         g &= ~r;
         cl[n] = r; own[n] = 0; cap[n] = T.fit[av][popc(r)]; n++;
     }
-    for (int j = 0; j < s.ncomp[c]; j++) {
-        BB cm = s.comp[c][j], nb = expand(cm);
+    for (int j = 0; j < ncomp; j++) {
+        BB cm = comps[j], nb = expand(cm);
         int into = -1;
         for (int i = 0; i < n; i++) {
             if (i == into || !(cl[i] & nb)) continue;
@@ -542,26 +548,51 @@ inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out
         if (into >= 0) { cl[into] |= cm; own[into] += popc(cm); }
     }
     int joinable = pieceCount(av) + 1;
-    if (s.ncomp[c] > joinable) {
+    if (ncomp > joinable) {
         for (int i = 0; i < n; i++) {
             int len[8], m = 0;
-            for (int j = 0; j < s.ncomp[c]; j++)
-                if (cl[i] & s.comp[c][j]) len[m++] = popc(s.comp[c][j]);
+            for (int j = 0; j < ncomp; j++)
+                if (cl[i] & comps[j]) len[m++] = popc(comps[j]);
             if (m <= joinable) continue;
             std::sort(len, len + m, std::greater<int>());
             own[i] = 0;
             for (int j = 0; j < joinable; j++) own[i] += len[j];
         }
     }
-    ub = lb;
+    int ub = lb;
     for (int i = 0; i < n; i++) {
         int u = own[i] + T.fit[av][std::min(cap[i], NIDX)];
         ub = std::max(ub, u);
         if (Record) { out->cells[out->n] = cl[i]; out->ub[out->n++] = u; }
     }
+    return ub;
+}
+// Growable cells of player c: empty cells not next to one of its full cells.
+inline BB growable(const Pos& s, int c) { return s.empty() & ~expand(shapeOf(s.own[c]).full); }
+template <bool Record>
+inline void snakeBoundsImpl(const Pos& s, int c, int& lb, int& ub, Clusters* out) {
+    lb = s.L[c];
+    if (Record) out->n = 0;
+    uint8_t av = s.avail[c];
+    if (!av) { ub = lb; return; }
+    ub = clusterBound<Record>(growable(s, c), s.comp[c], s.ncomp[c], av, lb, out);
 }
 inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) { snakeBoundsImpl<false>(s, c, lb, ub, nullptr); }
 inline void snakeClusters(const Pos& s, int c, int& lb, int& ub, Clusters& out) { snakeBoundsImpl<true>(s, c, lb, ub, &out); }
+// Upper bound of player c after cells m (empty now) are taken by the opponent, given c's
+// clusters: only the clusters that m covers change, and only those are recomputed.
+inline int boundAfterBlock(const Pos& s, int c, const Clusters& cl, int lb, BB m) {
+    int ub = lb;
+    for (int i = 0; i < cl.n; i++) {
+        if (!(cl.cells[i] & m)) { ub = std::max(ub, cl.ub[i]); continue; }
+        BB comps[8];
+        int nc = 0;
+        for (int j = 0; j < s.ncomp[c]; j++)
+            if (cl.cells[i] & s.comp[c][j]) comps[nc++] = s.comp[c][j];
+        ub = std::max(ub, clusterBound<false>(cl.cells[i] & ~s.own[c] & ~m, comps, nc, s.avail[c], lb, nullptr));
+    }
+    return ub;
+}
 // Longest snake of player c if c placed pl (a legal placement for c) now.
 inline int lengthAfter(const Pos& s, int c, const Placement& pl) {
     int merged = pl.n;
