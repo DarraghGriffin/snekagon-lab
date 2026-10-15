@@ -55,7 +55,7 @@ on every push to `main`. Both front ends share the protocol in `src/serve.hpp`.
 | evaluation (`eval.hpp`) | features from a Tron-style Voronoi split (who reaches which cell first from its growable snake ends), per-snake territory, bounds, number of snakes…; **logistic regression fitted on ~68 000 positions whose exact result was computed by the solver** (`tools/fit_eval.py`). Hold-out: predicts the winner in 87–90 % of decisive positions (hand-made eval: 72 %). |
 | search (`search.hpp`) | iterative-deepening PVS α-β, TT on symmetry-canonical keys, killers/history, forward pruning (best 24 by 1-ply eval at depth ≥ 2), bound cutoffs, the exact solver once ≤ 6 pieces remain; parallel over root moves with multi-PV. Depth 4–5 in 3 s early in the game. The default engine `ab2` adds exact verdicts on the root moves once ≤ 10 pieces remain (null-window win and draw proofs with all threads, interleaved with the search), which is where games between the engines are decided. |
 | exact solver (`solver.hpp`) | negamax over {loss, draw, win}, TT, bound cutoffs, **threat zones**, an exact closed form for the last two pieces, TT/killer/static ordering + learned-eval ordering when ≥ 7 pieces remain; `solve()` takes a window, so "does the side to move win?" is a cheaper null-window question; `parallelSolve` splits root moves over threads. |
-| threat zones (`Solver::scanThreats`) | an opponent placement *b* is a threat when, played as a free move, it makes the bounds decide the game. Any move that leaves *b* playable (does not cover it, nor touch it when *b* starts a new snake) lets the opponent answer with *b*, and the bounds only tighten from there, so such moves are worth at most that result: only moves through the zone of every threat are searched (the "must-play" region of Hex solvers). Threats come from the killer refutations one ply down and, once a node's first move fails, from a scan of all opponent placements, filtered cluster by cluster. Two threats with disjoint zones end the node without searching any move. |
+| threat zones (`Solver::scanThreats`) | an opponent placement *b* is a threat when, played as a free move, it makes the bounds decide the game. Any move that leaves *b* playable (does not cover it, nor touch it when *b* starts a new snake) lets the opponent answer with *b*, and the bounds only tighten from there, so such moves are worth at most that result: only moves through the zone of every threat are searched (the "must-play" region of Hex solvers). Threats come from the killer refutations one ply down and, once a node's first move fails, from a scan of all opponent placements, filtered cluster by cluster. A move must meet every such zone to be searched, so a few threats with small zones leave few moves. |
 
 **Strength:** `snek arena` (random opening = random 1-hex + random reply, each opening played with both
 colours, 1 s/move):
@@ -160,7 +160,7 @@ to answer every move. That first winning move, however, rarely has the smallest 
 
 The loser's "every move" is where threat zones cut: once a node's first move fails, the opponent's free
 placements that would make the bounds decide restrict the moves left to search (at red's nodes in these units,
-a third to two thirds of the moves are skipped), and two threats with disjoint zones end the node at once.
+a third to two thirds of the moves are skipped).
 Below them, the last two pieces are a closed form instead of two plies of search. Same benchmark, one fresh
 process per unit (empty tables), 4 at a time on a Ryzen 7 250; each row adds one change:
 

@@ -111,8 +111,7 @@ inline bool lastPiecesValue(const Position& pos, int& value) {
 // and the bounds only tighten as cells fill up (our upper bound counts every cell we could still
 // use, so it covers our own move too). Such moves are therefore worth at most the bounds' verdict,
 // and only moves through the zone of every threat that is strong enough for the window need to be
-// searched (the "must-play" region of Hex solvers). Two threats with disjoint zones end a node
-// without searching any move.
+// searched (the "must-play" region of Hex solvers): a move must meet every such zone.
 
 struct Threat {
     Bitboard zone;  // our moves that cover none of these cells leave the threat playable

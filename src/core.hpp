@@ -583,7 +583,8 @@ inline void snakeBounds(const Pos& s, int c, int& lb, int& ub) { snakeBoundsImpl
 inline void snakeClusters(const Pos& s, int c, int& lb, int& ub, Clusters& out) { snakeBoundsImpl<true>(s, c, lb, ub, &out); }
 // Upper bound of player c after cells m (empty now) are taken by the opponent, given c's
 // clusters: only the clusters that m covers change, and only those are recomputed.
-// A connected placement m lies in one region; when the region stays connected without m
+// When m's growable cells all lie in one region (they can be split by a cell that is not growable,
+// and then the cluster is recomputed) and the region stays connected without m
 // (the cells next to m are still connected within distance 2 of m), every snake keeps
 // touching it and the region still holds as many piece cells, the cluster bound is unchanged.
 inline int boundAfterBlock(const Pos& s, int c, const Clusters& cl, int lb, BB m) {
