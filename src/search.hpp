@@ -2,10 +2,15 @@
 // exact snake-length bounds as hard cutoffs, the exact solver once few pieces are
 // left, forward pruning (best-N by 1-ply eval) at inner nodes, parallel over root
 // moves with multi-PV so the UI gets real scores for the top moves.
+// Two configurations: "ab" (the first version) and "ab2", which adds exact verdicts on
+// the root moves once at most 10 pieces are left (games between these engines are
+// usually decided by plies 5-6, where the solver can tell winning moves apart within a
+// second) and uses the whole move time for the search.
 #pragma once
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include "core.hpp"
@@ -19,8 +24,21 @@ struct AbParams {
     int solveRem = 6;            // total pieces left (both players) at which the exact solver is tried
     uint64_t solveNodes = 20000; // node budget for that attempt
     int width = 24;              // moves searched at nodes with depth >= 2 (after 1-ply eval sort)
+    double newIteration = 0.35;  // no iteration starts after this share of the move time
+    bool partialIterations = false;  // an iteration cut off by the deadline still ranks the root moves it finished
+    int exactRem = 0;            // exact root verdicts once at most this many pieces are left (0 = never)
+    int exactFirstRem = 0;       // ... with a first exact phase in 1-ply order, before the heuristic search
+    double exactFirstShare = 0.5;  // share of the move time for that first exact phase
+    double heuristicShare = 0.35;  // share of the remaining time for the heuristic search; the exact phase gets the rest
 };
-inline AbParams AP;
+inline AbParams abParamsV2() {
+    AbParams p;
+    p.newIteration = 0.6;
+    p.partialIterations = true;
+    p.exactRem = 10;
+    p.exactFirstRem = 9;
+    return p;
+}
 
 struct AbEntry {
     uint64_t key;
@@ -36,6 +54,7 @@ inline int terminalScore(const Pos& s) {
 }
 
 struct AbSearcher {
+    const AbParams& P;
     std::vector<AbEntry> tt;
     uint64_t mask;
     Solver solver;
@@ -46,7 +65,7 @@ struct AbSearcher {
     std::chrono::steady_clock::time_point deadline;
     bool aborted = false;
 
-    explicit AbSearcher(int log2 = 19) : solver(19) {
+    explicit AbSearcher(const AbParams& params, int log2 = 19) : P(params), solver(19) {
         tt.assign(size_t(1) << log2, AbEntry{0, 0, -1, 0, -1});
         mask = (uint64_t(1) << log2) - 1;
         for (auto& h : hist) h.assign(T.NGID, 0);
@@ -70,8 +89,8 @@ struct AbSearcher {
         if (ubM < lbO) { v = -WIN - 100 * (lbO - ubM); return true; }
         if (lbM == ubM && lbO == ubO && lbM == lbO) { v = 0; return true; }
         int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
-        if (rem <= AP.solveRem) {
-            int r = solver.solve(s, 0, AP.solveNodes);
+        if (rem <= P.solveRem) {
+            int r = solver.solve(s, 0, P.solveNodes);
             if (r != -9) { v = r > 0 ? WIN : r < 0 ? -WIN : 0; return true; }
         }
         return false;
@@ -137,7 +156,7 @@ struct AbSearcher {
         // forward pruning: only the best `width` moves at depth >= 2 - unless every move
         // tried so far is a proven loss (otherwise a pruned move could still save the game
         // and we would report a false "forced win" for the opponent)
-        int limit = depth >= 2 ? std::min(n, AP.width) : n;
+        int limit = depth >= 2 ? std::min(n, P.width) : n;
 
         int a0 = alpha, best = -INF, bestGid = -1;
         for (int k = 0; k < n; k++) {
@@ -168,12 +187,17 @@ struct AbSearcher {
     }
 };
 
+// Exact verdict on a root move, for the side to move. NotWin: proven not to win (a draw or a loss).
+enum class Verdict : int8_t { Unknown, Win, NotWin, Draw, Loss };
+
 struct RootResult {
     Move mv;
     int score = 0;
     bool exact = false;  // score is exact (not just an upper bound)
     int depth = 0;
     int display = 0;     // score averaged over the last two iterations (damps odd/even swings)
+    Verdict verdict = Verdict::Unknown;
+    bool exactTried = false;  // the exact phase started on this move
 };
 
 struct AbAnalysis {
@@ -201,39 +225,221 @@ inline double scoreToWinProb(int score) {
     return 1.0 / (1.0 + std::exp(-score / 100.0));
 }
 
-inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int multipv = 1, int maxDepth = 64) {
-    using clk = std::chrono::steady_clock;
-    auto t0 = clk::now();
-    auto deadline = t0 + std::chrono::microseconds((long long)(seconds * 1e6));
-    std::atomic<bool> stop{false};
-    static std::vector<std::unique_ptr<AbSearcher>> pool;  // reused between calls (TT warm)
-    while ((int)pool.size() < threads) pool.emplace_back(new AbSearcher());
-    for (int i = 0; i < threads; i++) { pool[i]->stop = &stop; pool[i]->deadline = deadline; pool[i]->aborted = false; pool[i]->nodes = 0; }
+// One engine configuration with the state it keeps between moves: a searcher per thread and the
+// exact solvers of the root verdicts, which share one table (later positions of a game are
+// subtrees of earlier ones, so proofs carry over).
+struct AbEngine {
+    AbParams P;
+    std::vector<std::unique_ptr<AbSearcher>> pool;
+    std::shared_ptr<LTT> exactTT;
+    std::vector<std::unique_ptr<Solver>> exactPool;
+    explicit AbEngine(const AbParams& p) : P(p) {}
+};
+inline AbEngine& abEngine(int version) {
+    static AbEngine v1{AbParams{}}, v2{abParamsV2()};
+    return version == 2 ? v2 : v1;
+}
 
+// Value of s for the side to move from the exact solver with window (alpha, beta), or -9 if the
+// deadline or the stop flag came first.
+inline int solveWindow(Solver& S, const Pos& s, int alpha, int beta, std::chrono::steady_clock::time_point deadline,
+                       std::atomic<bool>* stop) {
+    S.nodes = 0;
+    if (s.over()) return Solver::terminalValue(s);
+    S.stop = stop;
+    S.useDeadline = true;
+    S.deadline = deadline;
+    S.nodeLimit = UINT64_MAX;
+    S.aborted = false;
+    int v = S.search(s, alpha, beta);
+    return S.aborted ? -9 : v;
+}
+
+// The best root move is proven: a win, a draw once no move wins, or every move loses.
+inline bool verdictsSettle(const std::vector<RootResult>& moves) {
+    bool allLost = !moves.empty();
+    for (auto& r : moves) {
+        if (r.verdict == Verdict::Win || r.verdict == Verdict::Draw) return true;
+        if (r.verdict != Verdict::Loss) allLost = false;
+    }
+    return allLost;
+}
+
+// Exact verdicts on the root moves, in their current order (most promising first), until the
+// deadline: first "does it win" for every move (null window below a draw), then, once no move
+// wins, "does it draw" for the others. Stops at the first win or draw: nothing better exists then.
+// Moves are taken strictly in order: the winning move is usually among the first few, and node
+// budgets per move (to skip expensive proofs) settled fewer positions in the same time.
+inline uint64_t exactVerdicts(const Pos& root, std::vector<RootResult>& moves, std::chrono::steady_clock::time_point deadline,
+                              int threads, AbEngine& E) {
+    if (!E.exactTT) E.exactTT = std::make_shared<LTT>(22);  // 2^23 entries, 128 MB
+    while ((int)E.exactPool.size() < threads) E.exactPool.emplace_back(new Solver(E.exactTT));
+    std::atomic<uint64_t> nodes{0};
+    for (int phase = 0; phase < 2; phase++) {
+        if (verdictsSettle(moves)) break;
+        Verdict todo = phase == 0 ? Verdict::Unknown : Verdict::NotWin;
+        // "does it draw" only once every move is known not to win
+        if (phase == 1)
+            for (auto& r : moves) if (r.verdict == Verdict::Unknown) return nodes;
+        std::atomic<size_t> next{0};
+        std::atomic<bool> stop{false};
+        auto work = [&](int w) {
+            Solver& S = *E.exactPool[w];
+            for (;;) {
+                size_t k = next++;
+                if (k >= moves.size() || stop) break;
+                RootResult& r = moves[k];
+                if (r.verdict != todo) continue;
+                r.exactTried = true;
+                Pos c = root; c.play(r.mv);
+                // the opponent's value: below a draw (phase 0), at most a draw (phase 1)?
+                int v = phase == 0 ? solveWindow(S, c, -1, 0, deadline, &stop) : solveWindow(S, c, 0, 1, deadline, &stop);
+                nodes += S.nodes;
+                if (v == -9) break;
+                if (phase == 0) r.verdict = v < 0 ? Verdict::Win : Verdict::NotWin;
+                else r.verdict = v <= 0 ? Verdict::Draw : Verdict::Loss;
+                if (r.verdict == Verdict::Win || r.verdict == Verdict::Draw) stop = true;
+            }
+        };
+        if (threads == 1) work(0);  // inline, so it also runs where there are no threads (WebAssembly)
+        else {
+            std::vector<std::thread> th;
+            for (int w = 0; w < threads; w++) th.emplace_back(work, w);
+            for (auto& t : th) t.join();
+        }
+    }
+    return nodes;
+}
+
+// Reorders moves as moves[0], the first of `other` not yet taken, moves[1], ... (each move once).
+inline void interleave(std::vector<RootResult>& moves, const std::vector<Move>& other) {
+    std::vector<int> at(T.NGID + 1, -1);  // gid + 1 -> index in moves (a pass has gid -1)
+    for (size_t i = 0; i < moves.size(); i++) at[moves[i].mv.gid + 1] = (int)i;
+    std::vector<char> taken(moves.size(), 0);
+    std::vector<RootResult> out;
+    out.reserve(moves.size());
+    size_t j = 0;
+    for (size_t i = 0; i < moves.size(); i++) {
+        if (!taken[i]) { taken[i] = 1; out.push_back(moves[i]); }
+        for (; j < other.size(); j++) {
+            int k = at[other[j].gid + 1];
+            if (k >= 0 && !taken[k]) { taken[k] = 1; out.push_back(moves[k]); j++; break; }
+        }
+    }
+    moves = out;
+}
+
+// Moves proven lost go last (stable), so the heuristic search never starts from one.
+inline void lostMovesLast(std::vector<RootResult>& moves) {
+    std::stable_partition(moves.begin(), moves.end(), [](const RootResult& r) { return r.verdict != Verdict::Loss; });
+}
+
+// Share of the opponent's replies to m that the exact table already proves lost for the opponent:
+// how far a running "does m win" proof got.
+inline double proofProgress(const Pos& root, Move m, const LTT& tt) {
+    Pos c = root; c.play(m);
+    int proven = 0, total = 0;
+    c.forEachLegal([&](Move x) {
+        Pos g = c; g.play(x);
+        int t, lo, hi, best;
+        total++;
+        if (g.over() ? Solver::terminalValue(g) > 0 : tt.probe(g.key(t), lo, hi, best) && lo >= 1) proven++;
+    });
+    return total ? (double)proven / total : 0;
+}
+
+// Final ranking once verdicts are known: a proven win; the moves whose "does it win" proof was
+// still running at the deadline, the furthest proof first (the exact phase refutes the candidates
+// in order, so a winning move is usually one of them); a proven draw; the remaining moves (proven
+// not to win or never tried) in candidate order; proven losses. Scores are capped at what the
+// verdict allows.
+enum RankClass { ProvenWin, ProofRunning, ProvenDraw, NoWinOrUntried, ProvenLoss };
+inline void rankByVerdict(const Pos& root, std::vector<RootResult>& moves, const AbEngine& E) {
+    std::vector<double> progress(moves.size(), 0);
+    for (size_t i = 0; i < moves.size(); i++) {
+        RootResult& r = moves[i];
+        if (r.verdict == Verdict::Win) { r.score = r.display = WIN; r.exact = true; }
+        else if (r.verdict == Verdict::Draw) { r.score = r.display = 0; r.exact = true; }
+        else if (r.verdict == Verdict::NotWin) { r.score = std::min(r.score, 0); r.display = std::min(r.display, 0); }
+        else if (r.verdict == Verdict::Unknown && r.exactTried && E.exactTT) progress[i] = proofProgress(root, r.mv, *E.exactTT);
+    }
+    auto rankClass = [](const RootResult& r) {
+        switch (r.verdict) {
+            case Verdict::Win: return ProvenWin;
+            case Verdict::Unknown: return r.exactTried ? ProofRunning : NoWinOrUntried;
+            case Verdict::Draw: return ProvenDraw;
+            case Verdict::NotWin: return NoWinOrUntried;
+            default: return ProvenLoss;
+        }
+    };
+    std::vector<size_t> order(moves.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        RankClass ca = rankClass(moves[a]), cb = rankClass(moves[b]);
+        if (ca != cb) return ca < cb;
+        return ca == ProofRunning && progress[a] > progress[b];
+    });
+    std::vector<RootResult> out;
+    for (size_t i : order) out.push_back(moves[i]);
+    moves = out;
+}
+
+// Depth 1: the symmetry-unique root moves scored exactly where known, otherwise by the evaluation, best first.
+inline std::vector<RootResult> rootMovesByEval(const Pos& root, AbSearcher& S) {
     std::vector<Move> mv = uniqueRootMoves(root);
     int n = (int)mv.size();
     std::vector<RootResult> cur(n);
-    for (int i = 0; i < n; i++) cur[i].mv = mv[i];
-    // depth 1: exact where known, otherwise evaluation
     for (int i = 0; i < n; i++) {
         Pos c = root; c.play(mv[i]);
         int v;
         if (c.over()) v = -terminalScore(c);
-        else if (pool[0]->exactKnown(c, v)) v = -v;
+        else if (S.exactKnown(c, v)) v = -v;
         else v = -evaluate(c);
-        cur[i].score = v; cur[i].exact = true; cur[i].depth = 1; cur[i].display = v;
+        cur[i].mv = mv[i]; cur[i].score = v; cur[i].exact = true; cur[i].depth = 1; cur[i].display = v;
     }
     std::stable_sort(cur.begin(), cur.end(), [](auto& a, auto& b) { return a.score > b.score; });
-    AbAnalysis res;
-    res.moves = cur;
-    res.depth = 1;
-    if (n == 1) return res;
+    return cur;
+}
 
-    for (int depth = 2; depth <= maxDepth; depth++) {
-        double el = std::chrono::duration<double>(clk::now() - t0).count();
-        if (el > seconds * 0.35) break;
+inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int multipv = 1, int maxDepth = 64,
+                            AbEngine& E = abEngine(1)) {
+    using clk = std::chrono::steady_clock;
+    const AbParams& P = E.P;
+    auto t0 = clk::now();
+    auto deadline = t0 + std::chrono::microseconds((long long)(seconds * 1e6));
+    std::atomic<bool> stop{false};
+    auto& pool = E.pool;  // reused between calls (TT warm)
+    while ((int)pool.size() < threads) pool.emplace_back(new AbSearcher(P));
+
+    AbAnalysis res;
+    res.moves = rootMovesByEval(root, *pool[0]);
+    res.depth = 1;
+    int n = (int)res.moves.size();
+    if (n == 1) return res;
+    std::vector<Move> evalOrder(n);
+    for (int i = 0; i < n; i++) evalOrder[i] = res.moves[i].mv;
+
+    // exact root verdicts after the heuristic search; when the solver is fast, also a first exact
+    // phase in 1-ply order before it
+    int rem = pieceCount(root.avail[0]) + pieceCount(root.avail[1]);
+    bool exactOn = P.exactRem && rem <= P.exactRem;
+    bool exactFirst = exactOn && rem <= P.exactFirstRem;
+    if (exactFirst) {
+        res.nodes += exactVerdicts(root, res.moves, t0 + std::chrono::microseconds((long long)(seconds * P.exactFirstShare * 1e6)), threads, E);
+        lostMovesLast(res.moves);
+    }
+    // the heuristic search: all the time, or its share of what is left when an exact phase follows
+    auto heurStart = exactOn ? clk::now() : t0;
+    double left = seconds - std::chrono::duration<double>(heurStart - t0).count();
+    double heurSeconds = exactOn ? left * P.heuristicShare : seconds;
+    auto heurDeadline = heurStart + std::chrono::microseconds((long long)(heurSeconds * 1e6));
+    for (int i = 0; i < threads; i++) { pool[i]->stop = &stop; pool[i]->deadline = heurDeadline; pool[i]->aborted = false; pool[i]->nodes = 0; }
+
+    for (int depth = 2; depth <= maxDepth && !verdictsSettle(res.moves); depth++) {
+        double el = std::chrono::duration<double>(clk::now() - heurStart).count();
+        if (el > heurSeconds * P.newIteration) break;
         std::vector<RootResult> next = res.moves;
-        for (auto& r : next) { r.exact = false; r.depth = depth; }
+        for (auto& r : next) if (r.verdict != Verdict::Loss) { r.exact = false; r.depth = depth; }
         std::atomic<int> nextIdx{0};
         std::mutex mu;
         std::vector<int> exactScores;  // for the multi-PV threshold
@@ -246,6 +452,7 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
         };
         std::vector<char> done(n, 0);
         auto searchOne = [&](AbSearcher& S, int i) {
+            if (next[i].verdict == Verdict::Loss) { done[i] = 1; return; }  // proven: keeps its score
             Pos c = root; c.play(next[i].mv);
             int a = threshold();
             int v;
@@ -278,13 +485,18 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
         for (auto& x : th) x.join();
         bool complete = true;
         for (int i = 0; i < n; i++) if (!done[i]) complete = false;
-        if (!complete) break;
+        if (!complete && !P.partialIterations) break;
+        // a cut-off iteration ranks the moves it finished (the previous best is always among them)
+        // before the others, which keep the previous iteration's results
+        for (int i = 0; i < n; i++) if (!done[i]) next[i] = res.moves[i];
         std::stable_sort(next.begin(), next.end(), [](auto& a, auto& b) {
+            if (a.depth != b.depth) return a.depth > b.depth;
             if (a.exact != b.exact) return a.exact;
             return a.score > b.score;
         });
         // odd/even smoothing for display: average with the previous iteration where both are exact
         for (auto& r : next) {
+            if (r.depth != depth) continue;
             r.display = r.score;
             if (!r.exact || std::abs(r.score) >= WIN / 2) continue;
             for (auto& p : res.moves)
@@ -303,11 +515,20 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
         }
         res.moves = next;
         res.depth = depth;
+        if (!complete) break;
         if (next[0].exact && next[0].score >= WIN / 2) break;  // proven win found
         bool allLost = true;
         for (auto& r : next) if (r.score > -WIN / 2) allLost = false;
         if (allLost) break;
     }
     for (int i = 0; i < threads; i++) res.nodes += pool[i]->nodes;
+    if (exactOn) {
+        // candidates for the exact phase alternate between the search's and the 1-ply evaluation's
+        // favourites: each order often has the winning move near the top where the other has not
+        interleave(res.moves, evalOrder);
+        lostMovesLast(res.moves);
+        if (!verdictsSettle(res.moves) && clk::now() < deadline) res.nodes += exactVerdicts(root, res.moves, deadline, threads, E);
+        rankByVerdict(root, res.moves, E);
+    }
     return res;
 }
