@@ -69,6 +69,8 @@ struct Solver {
     uint64_t pPruned[16] = {}, pMoves[16] = {}, pLast[16] = {};  // ... / nodes solved by lastPieces  // moves skipped by threat zones / moves generated, per ply
     bool useThreats = envInt("SOLVER_THREATS", 1) != 0;
     bool useLastPieces = envInt("SOLVER_LAST", 1) != 0;
+    bool useHistory = envInt("SOLVER_HISTORY", 1) != 0;                 // history scores in the move ordering
+    bool killersOverEval = envInt("SOLVER_KILLERS_OVER_EVAL", 1) != 0;  // killers ahead of the learned-eval ordering
     bool threatScan = envInt("SOLVER_THREAT_SCAN", 1) != 0;
     int evalOrderRem = envInt("SOLVER_EVAL_REM", 7);  // order children by the learned evaluation when >= this many pieces are left
     // deeper down, eval-order only where the side to move does not look lost: the losing side
@@ -344,7 +346,7 @@ struct Solver {
                 int tb = threatBound(pl.m, threats, nThreats);
                 if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; return; }
             }
-            int sc = H[m.gid] + PIECE_CELLS[m.piece()] * 64;
+            int sc = (useHistory ? H[m.gid] : 0) + PIECE_CELLS[m.piece()] * 64;
             if (pl.nb & me) sc += 256;
             if (pl.m & oppFront) sc += 128;
             else if (pl.nb & opp) sc += 32;
@@ -372,7 +374,7 @@ struct Solver {
                         return cv;
                     }
                 }
-                if (doEval && score[i] < (1 << 28))
+                if (doEval && score[i] < (killersOverEval ? 1 << 28 : 1 << 30))
                     score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
             }
         }
