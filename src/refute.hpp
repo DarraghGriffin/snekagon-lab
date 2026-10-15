@@ -53,7 +53,7 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
     std::vector<std::pair<double, Move>> ranked;
     for (Move m : all) {
         Pos c = s; c.play(m);
-        ranked.push_back({c.over() ? Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});
+        ranked.push_back({c.over() ? -Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});  // the attacker's view
     }
     std::stable_sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
     // a short engine search puts its best moves first: it ranks easy winners far higher than the

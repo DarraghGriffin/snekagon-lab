@@ -69,7 +69,13 @@ static void snakeBoundsRef(const Pos& s, int c, int& lb, int& ub) {
         if (!g) continue;
         int cap = 0;
         while (g) { BB r = flood(bit(lsb(g)), g); g &= ~r; cap += T.fit[av][popc(r)]; }
-        ub = std::max(ub, popc(K & me) + (int)T.fit[av][std::min(cap, NIDX)]);
+        // with k pieces left a final snake joins at most k + 1 old snakes: the longest of the cluster
+        std::vector<int> lens;
+        for (BB o = K & me; o;) { BB c = flood(bit(lsb(o)), o); o &= ~c; lens.push_back(popc(c)); }
+        std::sort(lens.rbegin(), lens.rend());
+        int own = 0;
+        for (size_t i = 0; i < lens.size() && (int)i <= pieceCount(av); i++) own += lens[i];
+        ub = std::max(ub, own + (int)T.fit[av][std::min(cap, NIDX)]);
     }
 }
 

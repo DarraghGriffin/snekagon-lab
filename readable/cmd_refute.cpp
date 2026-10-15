@@ -67,7 +67,7 @@ int cmdRefute(const Args& args) {
     for (Move m : all) {
         Position child = pos;
         child.play(m);
-        ranked.push_back({child.isOver() ? gameResult(child) * 1000.0 : -learnedLogit(child), m});
+        ranked.push_back({child.isOver() ? -gameResult(child) * 1000.0 : -learnedLogit(child), m});  // the attacker's view
     }
     std::stable_sort(ranked.begin(), ranked.end(), [](auto& a, auto& b) { return a.first > b.first; });
     std::vector<Move> todo;  // not settled by an earlier run
