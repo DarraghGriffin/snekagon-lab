@@ -1,0 +1,3 @@
+# snek solvepos (solver of commit ed2c6b1, exact values) on 1:60 4A:51,52,63,74 3V:29,40,50 4C:59,61,70,71, red to move
+root moves: 679  ply 4 stm 0
+ply 4 stm 0: value 0  (679/679 root moves solved, 7178085329 nodes, 462.1s)
