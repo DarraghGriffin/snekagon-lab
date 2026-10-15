@@ -151,7 +151,8 @@ A distributed unit only asks whether blue wins (`snek worker` still computes the
   ordering (`SOLVER_HISTORY=0 SOLVER_KILLERS_OVER_EVAL=0`, the defaults inside `PnSearch`; the plain solver
   keeps its ordering unless these are set): a move that made cutoffs in one subtree usually still wins in
   the next, but often with a much bigger proof than other winning moves. Half the nodes in the pilot's
-  units (the full-value solve too: 48.1 M → 22.3 M nodes on the benchmark).
+  units (the full-value solve too: 48.1 M → 22.3 M nodes on the benchmark), 1.6x fewer in random units
+  like the distributed solve's, no change in two other openings (table below).
 - **Proof-cost ordering at the root.** In the pilot's units, 10-32 of the eval's 40 best blue moves win,
   and together the cheapest proofs are 2.4x cheaper than the ones the win test commits to (up to 9x in a
   unit). A move's proof is the sum over red's 200-500 replies, and the typical reply cost differs ~10x
@@ -166,7 +167,7 @@ tried first. Nodes of the win tests (4 threads, fresh tables per unit with `BENC
 with its default sample, and the range and mean over 5 samples, `PNS_SEED=0..4`), and thread-seconds of
 runs interleaved two or three times on a busy machine (mean):
 
-| set, 24 units each (`bench/`) | alpha-beta | probe ordering | `PnSearch` | thread-s |
+| set, 24 units each (`bench/`) | alpha-beta | probe ordering | `PnSearch` | thread-s (same order) |
 |---|---|---|---|---|
 | `ply5_blue_wins.txt` (pilot) | 40.6 M | 19.7 M | **12.8 M** (12.8-14.8, mean 13.9) | 87.0 / 45.2 / 32.9 |
 | `ply5_blue_wins_holdout.txt` (pilot) | 42.9 M | 21.6 M | **11.8 M** (11.5-13.1, mean 12.3) | 77.2 / 41.1 / 25.4 |
