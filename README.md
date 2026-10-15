@@ -138,8 +138,52 @@ Tried and rejected (measured, no gain): enhanced transposition cutoffs, a TT sha
 learned-eval ordering (fewer nodes but the eval costs more than it saves), eval ordering only for the side
 that looks winning, a cheap single-region bound before the exact one, and "inert move" equivalence (a
 provably safe definition covers well under 1 % of moves). Profiling (`PROFILE=1 snek benchset …`) shows
-why big gains are hard: the winning side finds its move at the first try ~90 % of the time, so the search
-is already close to the minimal proof; the cost is the loser having to answer every move.
+that the winning side finds a winning move at the first try ~90 % of the time; the cost is the loser having
+to answer every move. That first winning move, however, rarely has the smallest proof (next section).
+
+### Win test: cheapest proofs first (`pns.hpp`)
+
+A distributed unit only asks whether blue wins (`snek worker` still computes the full value). `PnSearch`
+answers that question with ~3x fewer nodes than the alpha-beta win test (`BENCH_WINTEST=1`, window (0, 1)),
+from two changes:
+
+- **Ordering of the alpha-beta probes.** Without history scores and with killers behind the learned-eval
+  ordering (`SOLVER_HISTORY=0 SOLVER_KILLERS_OVER_EVAL=0`, the defaults inside `PnSearch`; the plain solver
+  keeps its ordering unless these are set), the win test needs half the nodes (the full-value solve too:
+  48.1 M → 22.3 M nodes on the benchmark): a move that made cutoffs in one subtree usually still wins in
+  the next, but with a much bigger proof than other winning moves.
+- **Proof-cost ordering at the root.** Of the eval's 40 best blue moves in a unit, 10-32 win, and
+  together the cheapest proofs are 2.4x cheaper than the ones the win test commits to (up to 9x in a
+  unit). A move's proof is the sum over red's 200-500 replies, and the typical reply cost differs ~10x
+  between moves where the eval sees no difference. So the eval's 8 best moves are screened: a sample of
+  each move's replies, spread over the eval order, gets alpha-beta probes of 1000 nodes, and
+  replies x the fraction of the sample above that budget estimates the move's proof number (its number of
+  hard replies). Rounds of 8, 8 and 16 samples halve the field each time (successive halving); a sampled
+  reply that is no blue win drops the move. The moves are then proved in the order of the estimate.
+
+Every answer comes from exact alpha-beta win tests, so budgets and samples only decide which proof is
+tried first. Win tests on 4 threads, fresh tables per unit (`BENCH_FRESH=1`), the three versions run
+interleaved three times on a busy machine (thread-seconds: median of the three):
+
+| win test | `bench/ply5_blue_wins.txt` nodes | thread-s | `bench/ply5_blue_wins_holdout.txt` nodes | thread-s |
+|---|---|---|---|---|
+| alpha-beta | 40.6 M | 82.6 | 42.9 M | 75.0 |
+| alpha-beta, ordering of the probes | 19.7 M | 44.9 | 21.6 M | 36.5 |
+| `PnSearch` (`BENCH_PNS=1`) | **12.8 M** (5 samples: 12.8-14.8, mean 13.9 M) | **32.7** | **11.8 M** (11.5-13.1, mean 12.3 M) | **23.9** |
+
+The held-out set is 24 other red moves of the pilot (all blue wins, cost in the same range, fixed random
+draw), not used for any tuning. Per unit the sample matters (0.5-2x between `PNS_SEED` values), the
+totals less (±8 %). Screening costs up to ~0.1 M nodes per unit, so units that alpha-beta solves in a few
+thousand nodes get more expensive.
+
+Tried and rejected (measured): classic best-first proof-number search over the first 2-3 plies, leaves
+initialised from the eval and typical costs and probed with doubling budgets (1.8-7x more nodes than
+alpha-beta); screening the expensive ply-7 nodes the same way, or racing blue's best answers there under
+doubling budgets and trying race winners first at the sibling nodes (large gains in a few units, losses in
+others, neutral in total, although fresh single-node tests show 3x cheaper answers exist there); ordering
+by the defender's mobility after the move (2-4x more nodes: the low-mobility move often does not win);
+12 or 16 screened moves, sample budgets of 500 or 2000, other sample sizes (none more than 5 % better);
+switching to the next screened move when the chosen one turns out expensive (simulated, no gain).
 
 ### Is a full solution feasible?
 
@@ -187,10 +231,10 @@ Other machines on the same network join with `snek worker <ip>:8090 <threads>` (
 | `snek gendata <games> <plyMin> <plyMax> <solveSec> <threads> <seed>` | labelled positions (features + exact value) as CSV |
 | `python tools/fit_eval.py data/*.csv` | fit the evaluation → `src/eval_weights.hpp`, `data/weights_latest.txt` |
 | `snek solvepos <sec> <threads> <moves…>` | parallel exact solve of a position |
-| `snek solvebench <plies> <n> <sec> <threads>` | solver benchmark on random positions |
+| `snek solvebench <plies> <n> <sec> <threads>` | solver benchmark on random positions (`SOLVER_PNS=1`: values from two `PnSearch` win tests) |
 | `snek selfplay <games> <sec> <threads>` | engine vs itself, prints the game |
 | `snek verify [games]` | fast move generator == reference checker, incremental snakes and fast bounds == reference, bounds never violated |
-| `snek benchset <file> <threads>` | solver benchmark on a fixed position set (`PROFILE=1` prints per-ply statistics) |
+| `snek benchset <file> <threads>` | solver benchmark on a fixed position set (`PROFILE=1` prints per-ply statistics, `BENCH_WINTEST=1` only asks whether the side to move wins, `BENCH_PNS=1` with it uses `PnSearch`, `BENCH_FRESH=1` empties the tables between positions) |
 | `snek perft <d>`, `snek speed`, `snek info` | counting / micro-benchmarks |
 | `python ref/crosscheck.py [games]` | engine vs independent Python rules implementation |
 
@@ -211,6 +255,9 @@ Other machines on the same network join with `snek worker <ip>:8090 <threads>` (
 - `snek verify 3000`: bit-parallel generator gives the identical move list (same order) as the per-placement
   checker in 47 131 positions; the length bounds held for the final result in all 94 262 checks.
 - Solver v2 gives the same values as v1 on all benchmark positions.
+- `PnSearch` gives the solver's values (`SOLVER_PNS=1 snek solvebench …`, red bonus −1/0/1) on 1 608 random
+  positions after 5–12 plies (screening from 8 pieces left at plies 6–7 and from 4 at plies 8–12
+  (`PNS_SCREEN_REM`), so that it runs at every level), and blue wins all 48 benchmark units.
 - `perft`: 1 → 91, 2 → 194 388, 3 → 315 706 848.
 
 ## Layout
@@ -221,6 +268,7 @@ Other machines on the same network join with `snek worker <ip>:8090 <threads>` (
 | `src/eval.hpp`, `src/eval_weights.hpp` | features, learned + hand-made evaluation |
 | `src/search.hpp` | α-β playing engine |
 | `src/solver.hpp` | exact solver, parallel solve |
+| `src/pns.hpp` | win test that screens the root moves for the cheapest proof |
 | `src/mcts.hpp` | v1 MCTS engine (kept for comparison) |
 | `src/main.cpp` | CLI + UI protocol |
 | `readable/` | the same engine refactored for reading (identical results), with a reading guide: [readable/README.md](readable/README.md) |
