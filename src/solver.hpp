@@ -365,6 +365,19 @@ struct Solver {
         int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
         bool doEval = n > 1 && (rem >= evalOrderRem || (rem >= evalOrderRemWin && learnedLogit(s) > evalWinThreshold));
         bool doEtc = n > 0 && rem >= etcRem;
+        // the evaluation is expensive: when the table or a killer suggests a move, try it first and
+        // evaluate the other moves only if it does not cut off
+        bool evalLater = false;
+        if (doEval && !doEtc)
+            for (int i = 0; i < n && !evalLater; i++) evalLater = score[i] >= (1 << 28);
+        if (evalLater) doEval = false;
+        auto evaluateRest = [&](int from) {
+            for (int i = from; i < n; i++)
+                if (score[i] < (1 << 28)) {
+                    Pos c = s; c.play(moves[i]);
+                    score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
+                }
+        };
         if (doEval || doEtc) {
             for (int i = 0; i < n; i++) {
                 Pos c = s; c.play(moves[i]);
@@ -378,9 +391,8 @@ struct Solver {
                         return cv;
                     }
                 }
-                if (doEval && score[i] < (1 << 28))
-                    score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
             }
+            if (doEval) evaluateRest(0);
         }
         pMoves[pp] += n;
         int best = -2, bestGid = -1;
@@ -390,6 +402,7 @@ struct Solver {
             best = -search(c, -beta, -alpha);
         } else {
             for (int i = 0; i < n; i++) {
+                if (evalLater && i == 1) { evaluateRest(1); evalLater = false; }
                 if (i < FULL_SORT_AFTER) {  // pick the best remaining move: most nodes cut on the first one
                     int bi = i;
                     for (int j = i + 1; j < n; j++) if (score[j] > score[bi]) bi = j;

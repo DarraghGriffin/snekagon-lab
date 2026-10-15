@@ -51,10 +51,11 @@ on every push to `main`. Both front ends share the protocol in `src/serve.hpp`.
 | Component | What it does |
 |---|---|
 | move generation (`core.hpp`) | for each of the 40 piece orientations the legality of **all anchor cells at once** is an AND/OR of shifted 128-bit boards (no-overlap, isolation for new snakes, own-degree ≤ 2, no sharp turns, touching own). ~2.6 µs for a full move list, perft 3 in 0.95 s (4.3× faster than v1). |
-| length bounds (`snakeBounds`) | **sound** lower/upper bound of each player's final longest snake: a player can never again occupy a cell next to its own snake body, so the final snake lies in one cluster of *own cells ∪ growable cells*; new cells ≤ subset-sum fit of the remaining pieces into the growable regions. Detects enclosed snakes immediately. |
+| length bounds (`snakeBounds`) | **sound** lower/upper bound of each player's final longest snake: a player can never again occupy a cell next to its own snake body, so the final snake lies in one cluster of *own cells ∪ growable cells*; new cells ≤ subset-sum fit of the remaining pieces into the growable regions; with k pieces left at most the k + 1 longest snakes of a cluster can end up in one final snake (old snakes and new pieces alternate along it). Detects enclosed snakes immediately. |
 | evaluation (`eval.hpp`) | features from a Tron-style Voronoi split (who reaches which cell first from its growable snake ends), per-snake territory, bounds, number of snakes…; **logistic regression fitted on ~68 000 positions whose exact result was computed by the solver** (`tools/fit_eval.py`). Hold-out: predicts the winner in 87–90 % of decisive positions (hand-made eval: 72 %). |
 | search (`search.hpp`) | iterative-deepening PVS α-β, TT on symmetry-canonical keys, killers/history, forward pruning (best 24 by 1-ply eval at depth ≥ 2), bound cutoffs, the exact solver once ≤ 6 pieces remain; parallel over root moves with multi-PV. Depth 4–5 in 3 s early in the game. |
-| exact solver (`solver.hpp`) | negamax over {loss, draw, win}, TT, bound cutoffs, TT/killer/history ordering + learned-eval ordering when ≥ 7 pieces remain; `parallelSolve` splits root moves over threads. |
+| exact solver (`solver.hpp`) | negamax over {loss, draw, win}, TT, bound cutoffs, **threat zones**, an exact closed form for the last two pieces, TT/killer/history ordering + learned-eval ordering when ≥ 7 pieces remain; `solve()` takes a window, so "does the side to move win?" is a cheaper null-window question; `parallelSolve` splits root moves over threads. |
+| threat zones (`Solver::scanThreats`) | an opponent placement *b* is a threat when, played as a free move, it makes the bounds decide the game. Any move that leaves *b* playable (does not cover it, nor touch it when *b* starts a new snake) lets the opponent answer with *b*, and the bounds only tighten from there, so such moves are worth at most that result: only moves through the zone of every threat are searched (the "must-play" region of Hex solvers). Threats come from the killer refutations one ply down and, once a node's first move fails, from a scan of all opponent placements, filtered cluster by cluster. Two threats with disjoint zones end the node without searching any move. |
 
 **Strength:** `snek arena` (random opening = random 1-hex + random reply, each opening played with both
 colours, 1 s/move):
@@ -176,7 +177,8 @@ bash dist/stop.sh           # stop (state in results/dist/ is kept, start.sh res
 
 Other machines on the same network join with `snek worker <ip>:8090 <threads>` (Windows:
 `snek.exe worker …`). Status page: `http://<ip>:8091/` (also `/events`, `/state`). Earlier verification results from
-`results/jobs/` are reused automatically.
+`results/jobs/` are reused automatically. Workers started with `SOLVER_WIN_TEST=1` only ask whether blue wins each
+unit (about 20% less work); a unit that is not a blue win then comes back as 0 (draw or loss) or -1 (loss).
 
 ## Tools
 
@@ -186,11 +188,12 @@ Other machines on the same network join with `snek worker <ip>:8090 <threads>` (
 | `snek arena <pairs> <sec> <threads> <A> <B> [seed]` | engine match; engines `ab`, `abhand`, `mcts`, `ab:<weights.txt>` |
 | `snek gendata <games> <plyMin> <plyMax> <solveSec> <threads> <seed>` | labelled positions (features + exact value) as CSV |
 | `python tools/fit_eval.py data/*.csv` | fit the evaluation → `src/eval_weights.hpp`, `data/weights_latest.txt` |
-| `snek solvepos <sec> <threads> <moves…>` | parallel exact solve of a position |
+| `snek solvepos <sec> <threads> <moves…>` | parallel exact solve of a position (`PROGRESS=<file>` logs and resumes; `SOLVER_WIN_TEST=1` only proves or refutes that the side to move loses: each root move is `loss` or `notloss`, much cheaper) |
+| `snek refute <threads> <log> <moves…>` | shows that the side to move cannot win (`REFUTE_LOSS=1`: that it loses), or finds a move that survives: for every move a reply after which the mover does not win (replies that refuted other moves first, then by the evaluation; `REFUTE_TRIES` × `REFUTE_NODES` M nodes), then a full search over all replies for the moves left open. Resumable log; every refutation is one position anyone can re-solve |
 | `snek solvebench <plies> <n> <sec> <threads>` | solver benchmark on random positions |
 | `snek selfplay <games> <sec> <threads>` | engine vs itself, prints the game |
 | `snek verify [games]` | fast move generator == reference checker, incremental snakes and fast bounds == reference, bounds never violated |
-| `snek benchset <file> <threads>` | solver benchmark on a fixed position set (`PROFILE=1` prints per-ply statistics) |
+| `snek benchset <file> <threads>` | solver benchmark on a fixed position set (`PROFILE=1` prints per-ply statistics, `BENCH_FRESH=1` starts every position from empty tables for reproducible node counts, `BENCH_WINTEST=1` only asks whether the side to move wins; a build with `-DSOLVER_TIMING` adds exclusive time per ply and per step) |
 | `snek perft <d>`, `snek speed`, `snek info` | counting / micro-benchmarks |
 | `python ref/crosscheck.py [games]` | engine vs independent Python rules implementation |
 
