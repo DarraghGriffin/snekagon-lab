@@ -18,6 +18,7 @@ static const std::map<std::string, Command> COMMANDS = {
     {"selfplay", {cmdSelfPlay, "selfplay [games] [s/move] [threads]"}},
     // exact solving
     {"solvepos", {cmdSolvePos, "solvepos <seconds> <threads> <move>...    (env PROGRESS=<file> to log/resume, SOLVER_WIN_TEST=1)"}},
+    {"refute", {cmdRefute, "refute <threads> <log> <move>...       the side to move cannot win (env REFUTE_LOSS=1: loses)"}},
     {"worker", {cmdWorker, "worker <coordinator[:port]> [threads] [name]   distributed solving"}},
     {"solvebench", {cmdSolveBench, "solvebench [plies] [count] [seconds] [threads]   (env SOLVER_PNS=1)"}},
     {"benchset", {cmdBenchSet, "benchset <file> [threads]             (env PROFILE, BENCH_FRESH, BENCH_WINTEST, BENCH_PNS, SOLVER_TT)"}},
