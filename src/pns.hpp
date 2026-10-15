@@ -30,9 +30,8 @@ struct PnSearch {
     static constexpr int SAMPLES[ROUNDS] = {8, 8, 16};  // replies probed per move and round
     bool trace = envInt("PNS_TRACE", 0) != 0;
 
-    // The probes order moves without history scores and with killers behind the eval: what made
-    // cutoffs in one subtree picks expensive (if winning) moves in the next, and the win test
-    // needs about half the nodes without it (SOLVER_HISTORY / SOLVER_KILLERS_OVER_EVAL override).
+    // The probes order moves with killers behind the eval: what made cutoffs in one subtree picks
+    // expensive (if winning) moves in the next (SOLVER_KILLERS_OVER_EVAL overrides).
     explicit PnSearch(int log2size = 22) : ab(log2size) {
         ab.killersOverEval = envInt("SOLVER_KILLERS_OVER_EVAL", 0) != 0;
     }
