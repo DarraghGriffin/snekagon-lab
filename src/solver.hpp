@@ -63,8 +63,9 @@ struct Solver {
     uint64_t nodeLimit = UINT64_MAX;
     // profiling counters per ply: visited, cut by TT, cut by bounds, expanded
     uint64_t pVisit[16] = {}, pTT[16] = {}, pBound[16] = {}, pExp[16] = {};
-    uint64_t pPruned[16] = {}, pMoves[16] = {};  // moves skipped by threat zones / moves generated, per ply
+    uint64_t pPruned[16] = {}, pMoves[16] = {}, pLast[16] = {};  // ... / nodes solved by lastPieces  // moves skipped by threat zones / moves generated, per ply
     bool useThreats = envInt("SOLVER_THREATS", 1) != 0;
+    bool useLastPieces = envInt("SOLVER_LAST", 1) != 0;
     bool threatScan = envInt("SOLVER_THREAT_SCAN", 1) != 0;
     int evalOrderRem = envInt("SOLVER_EVAL_REM", 7);  // order children by the learned evaluation when >= this many pieces are left
     // deeper down, eval-order only where the side to move does not look lost: the losing side
@@ -174,6 +175,47 @@ struct Solver {
         return v;
     }
 
+    // Exact value when each player has at most one piece left (-2 otherwise), without a search:
+    // the side to move places its piece, then the opponent makes its longest snake with the
+    // placements that are still legal. A placement only ever removes opponent placements
+    // (covered cells, or new snakes that would now touch it), never adds any.
+    static int lastPieces(const Pos& s) {
+        int me = s.stm, opp = me ^ 1;
+        int nMe = pieceCount(s.avail[me]), nOpp = pieceCount(s.avail[opp]);
+        if (nMe > 1 || nOpp > 1 || s.ply == 0) return -2;
+        int bonus = me == 0 ? RED_BONUS : -RED_BONUS;
+        auto result = [&](int lenMe, int lenOpp) { int d = lenMe + bonus - lenOpp; return d > 0 ? 1 : d < 0 ? -1 : 0; };
+        // the opponent's placements that would lengthen its longest snake, longest first
+        struct Reply { BB block; int len; };  // block: our cells that make the reply illegal
+        Reply replies[512];
+        int nr = 0;
+        if (nOpp) {
+            Pos asOpp = s;
+            asOpp.stm = (uint8_t)opp;
+            BB occ = s.occ();
+            asOpp.forEachLegal([&](Move q) {
+                const Placement& pl = q.pl();
+                int len = lengthAfter(s, opp, pl);
+                if (len > s.L[opp] && nr < 512) replies[nr++] = Reply{pl.nb & occ ? pl.m : pl.m | pl.nb, len};
+            });
+            std::sort(replies, replies + nr, [](const Reply& a, const Reply& b) { return a.len > b.len; });
+        }
+        auto oppBest = [&](BB ours) {
+            for (int i = 0; i < nr; i++) if (!(replies[i].block & ours)) return replies[i].len;
+            return (int)s.L[opp];
+        };
+        int best = -2;
+        if (nMe) {
+            s.forEachLegal([&](Move b) {
+                if (best == 1) return;
+                const Placement& pl = b.pl();
+                best = std::max(best, result(lengthAfter(s, me, pl), oppBest(pl.m)));
+            });
+        }
+        if (best == -2) best = result(s.L[me], oppBest(0));  // no piece or no legal placement: pass
+        return best;
+    }
+
     bool checkAbort() {
         if (aborted) return true;
         if ((nodes & 4095) == 0) {
@@ -201,6 +243,14 @@ struct Solver {
             if (lo >= hi || lo >= beta) { pTT[pp]++; return lo; }
             if (hi <= alpha) { pTT[pp]++; return hi; }
             if (eBest >= 0) ttMove = T.gidSym[eBest][T.inv[t]];
+        }
+        if (useLastPieces) {
+            int v = lastPieces(s);
+            if (v != -2) {
+                pLast[pp]++;
+                tt->store(k, v, v, eBest, 0);
+                return v;
+            }
         }
         // snake-length bound cutoffs
         int lbMe, ubMe, lbOp, ubOp;

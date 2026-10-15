@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
         std::vector<std::thread> th;
         std::mutex profMu;
-        uint64_t profV[16] = {}, profT[16] = {}, profB[16] = {}, profE[16] = {}, profP[16] = {}, profM[16] = {};
+        uint64_t profV[16] = {}, profT[16] = {}, profB[16] = {}, profE[16] = {}, profP[16] = {}, profM[16] = {}, profL[16] = {};
         int sharedLog2 = envInt("SOLVER_SHARED", 0);
         std::shared_ptr<LTT> shared = sharedLog2 ? std::make_shared<LTT>(sharedLog2 - 1) : nullptr;
         bool fresh = envInt("BENCH_FRESH", 0) != 0;
@@ -377,11 +377,11 @@ int main(int argc, char** argv) {
                         std::lock_guard<std::mutex> lk(profMu);
                         for (int p = 0; p < 16; p++) {
                             profV[p] += S.pVisit[p]; profT[p] += S.pTT[p]; profB[p] += S.pBound[p]; profE[p] += S.pExp[p];
-                            profP[p] += S.pPruned[p]; profM[p] += S.pMoves[p];
+                            profP[p] += S.pPruned[p]; profM[p] += S.pMoves[p]; profL[p] += S.pLast[p];
                         }
                         std::fill(S.pVisit, S.pVisit + 16, 0); std::fill(S.pTT, S.pTT + 16, 0);
                         std::fill(S.pBound, S.pBound + 16, 0); std::fill(S.pExp, S.pExp + 16, 0);
-                        std::fill(S.pPruned, S.pPruned + 16, 0); std::fill(S.pMoves, S.pMoves + 16, 0);
+                        std::fill(S.pPruned, S.pPruned + 16, 0); std::fill(S.pMoves, S.pMoves + 16, 0); std::fill(S.pLast, S.pLast + 16, 0);
                     }
                     sec[i] = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
                 }
@@ -396,11 +396,11 @@ int main(int argc, char** argv) {
         }
         printf("TOTAL %zu positions: %llu nodes, %.1f thread-seconds, %.1f s wall (%d threads)\n", ps.size(), (unsigned long long)tn, ts, wall, threads);
         if (getenv("PROFILE")) {
-            printf("ply     visited    tt-cut  bound-cut  expanded  threat-skip\n");
+            printf("ply     visited    tt-cut  last-pcs  bound-cut  expanded  threat-skip\n");
             for (int p = 0; p < 16; p++)
                 if (profV[p])
-                    printf("%3d %11llu %9.1f%% %9.1f%% %9.1f%% %9.1f%%\n", p, (unsigned long long)profV[p], 100.0 * profT[p] / profV[p],
-                           100.0 * profB[p] / profV[p], 100.0 * profE[p] / profV[p],
+                    printf("%3d %11llu %9.1f%% %8.1f%% %9.1f%% %9.1f%% %9.1f%%\n", p, (unsigned long long)profV[p], 100.0 * profT[p] / profV[p],
+                           100.0 * profL[p] / profV[p], 100.0 * profB[p] / profV[p], 100.0 * profE[p] / profV[p],
                            profP[p] + profM[p] ? 100.0 * profP[p] / (profP[p] + profM[p]) : 0.0);
         }
     } else if (mode == "evalexplain") {
