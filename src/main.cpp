@@ -699,7 +699,7 @@ int main(int argc, char** argv) {
         int pairs = argc > 2 ? std::atoi(argv[2]) : 10;
         double secs = argc > 3 ? std::atof(argv[3]) : 1;
         int threads = argc > 4 ? std::atoi(argv[4]) : 8;
-        std::string A = argc > 5 ? argv[5] : "ab", B = argc > 6 ? argv[6] : "mcts";
+        std::string A = argc > 5 ? argv[5] : "ab2", B = argc > 6 ? argv[6] : "mcts";
         uint64_t seed = argc > 7 ? std::atoll(argv[7]) : 2024;
         int randomPlies = argc > 8 ? std::atoi(argv[8]) : 2;  // random moves at the start of each opening
         Solver solver(22);
@@ -708,12 +708,17 @@ int main(int argc, char** argv) {
         std::vector<Move> buf;
         for (int p = 0; p < pairs; p++) {
             Pos open = Pos::start();
-            for (int k = 0; k < randomPlies; k++) { open.genMoves(buf); open.play(buf[rng.below((int)buf.size())]); }
+            std::string openRec;  // the random opening, so the printed record replays from the start
+            for (int k = 0; k < randomPlies; k++) {
+                open.genMoves(buf);
+                Move m = buf[rng.below((int)buf.size())];
+                openRec += moveStr(m) + " ";
+                open.play(m);
+            }
             for (int sw = 0; sw < (A == B ? 1 : 2); sw++) {  // identical engines: the swapped game would be the same
                 std::string e[2] = {sw ? B : A, sw ? A : B};
                 Pos s = open;
-                std::string rec = moveStr(Move{}) ;
-                rec.clear();
+                std::string rec = openRec;
                 while (!s.over()) {
                     Analysis a = analyze(s, secs, threads, solver, e[s.stm]);
                     rec += moveStr(a.items[0].mv) + " ";
