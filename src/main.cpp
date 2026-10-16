@@ -8,6 +8,8 @@
 //                              show that the side to move cannot win, or find a move that wins
 //   snek proveline <threads> <dir> <moves...>
 //                              settle every reply of the side to move with refute (see README)
+//   snek uniquemoves <seconds> <top> <threads> <moves...> [-- <move>...]
+//                              the side to move's symmetry-unique moves, best first
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -117,6 +119,36 @@ static int oneHandedBest(const Pos& s, int c, uint64_t& budget) {
 // First line of a refute log: the position, the question (REFUTE_LOSS) and SOLVER_RED_BONUS.
 static std::string refuteHeader(const Pos& s) {
     return "# refute " + posStr(s) + " loss " + std::to_string(envInt("REFUTE_LOSS", 0) != 0) + " bonus " + std::to_string(RED_BONUS);
+}
+
+// The side to move's symmetry-unique moves, best first: the `top` best of a `searchSecs` engine
+// search (multi-PV), then the rest in the evaluation's order (searchSecs 0: the evaluation's order
+// only). prob is the mover's win probability by the search (its top moves) or by the evaluation;
+// *depth (if given) gets the depth the search completed (0 without a search).
+struct RankedMove {
+    Move mv;
+    double prob;
+    bool searched;
+};
+static std::vector<RankedMove> movesBestFirst(const Pos& s, double searchSecs, int top, int threads, int* depth = nullptr) {
+    std::vector<std::pair<double, Move>> byEval;
+    for (Move m : uniqueRootMoves(s)) {
+        Pos c = s; c.play(m);
+        byEval.push_back({c.over() ? -Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});  // the mover's view
+    }
+    std::stable_sort(byEval.begin(), byEval.end(), [](auto& a, auto& b) { return a.first > b.first; });
+    std::vector<RankedMove> out;
+    if (depth) *depth = 0;
+    if (searchSecs > 0 && top > 0 && byEval.size() > 1) {
+        AbAnalysis an = abAnalyze(s, searchSecs, threads, top);
+        if (depth) *depth = an.depth;
+        for (size_t i = 0; i < an.moves.size() && (int)i < top; i++) out.push_back({an.moves[i].mv, scoreToWinProb(an.moves[i].score), true});
+    }
+    for (auto& [logit, m] : byEval) {
+        bool searched = std::any_of(out.begin(), out.end(), [&](const RankedMove& r) { return r.mv == m; });
+        if (!searched) out.push_back({m, 1.0 / (1.0 + std::exp(-logit)), false});
+    }
+    return out;
 }
 static void printDataHeader() {
     printf("game,ply,stm,value");
@@ -415,10 +447,14 @@ int main(int argc, char** argv) {
         // defender) with a refutation sweep for the opponent (the attacker): either an attacker answer
         // that wins against all defender replies after it, or proof that the attacker cannot win after
         // that reply. Answers that won against earlier replies are tried first (the same answer often
-        // wins again). The defender's best replies by the evaluation come first, so a reply that breaks
-        // the line shows up early; it stops there (the attacker does not win the line) unless
-        // PROVELINE_ALL=1. dir/summary.txt gets one line per reply ("<reply> wins <answer>" or
-        // "<reply> holds"); dir/<reply>.log are the sweeps' resumable logs; a rerun continues.
+        // wins again). The defender's best replies come first, so a reply that breaks the line shows
+        // up early; it stops there (the attacker does not win the line) unless PROVELINE_ALL=1.
+        // The order: the 8 best of a PROVELINE_SEARCH second engine search (multi-PV, as refute's
+        // REFUTE_SEARCH), then the evaluation's; kept in dir/order.txt so that a rerun takes the same
+        // order (PROVELINE_SEARCH=0, the default: the evaluation's order only).
+        // dir/summary.txt gets one line per reply ("<reply> wins <answer>" or "<reply> holds");
+        // dir/<reply>.log are the sweeps' resumable logs; a rerun continues. Each sweep starts with a
+        // line "reply <rank>/<count> <reply>".
         if (argc < 5) { printf("usage: snek proveline <threads> <dir> <moves...>\n"); return 1; }
         if (envInt("REFUTE_LOSS", 0)) { printf("proveline proves wins; REFUTE_LOSS is for refute only\n"); return 1; }
         int threads = std::atoi(argv[2]);
@@ -448,18 +484,39 @@ int main(int argc, char** argv) {
                 if (st == "wins" && ls >> a && std::find(answers.begin(), answers.end(), a) == answers.end()) answers.insert(answers.begin(), a);
             }
         }
-        std::vector<std::pair<double, Move>> replies;
-        for (Move m : uniqueRootMoves(s)) {
-            Pos c = s; c.play(m);
-            replies.push_back({c.over() ? -Solver::terminalValue(c) * 1000.0 : -learnedLogit(c), m});  // the defender's view
+        // the defender's replies, best first (an order kept from an earlier run comes first)
+        int searchSecs = envInt("PROVELINE_SEARCH", 0);
+        std::string orderPath = dir + "/order.txt";
+        std::vector<RankedMove> ranked = movesBestFirst(s, 0, 0, threads);
+        std::vector<Move> replies;
+        if (searchSecs > 0) {
+            std::ifstream in(orderPath);
+            std::string tok;
+            Move m;
+            while (in >> tok)
+                if (parseMove(tok, m) && std::find(replies.begin(), replies.end(), m) == replies.end() &&
+                    std::any_of(ranked.begin(), ranked.end(), [&](const RankedMove& r) { return r.mv == m; }))
+                    replies.push_back(m);
+            if (replies.empty()) {
+                int depth;
+                ranked = movesBestFirst(s, searchSecs, 8, threads, &depth);
+                printf("order: %zu replies, the 8 best of a %d s search (depth %d) first\n", ranked.size(), searchSecs, depth);
+                FILE* f = fopen(orderPath.c_str(), "w");
+                for (auto& r : ranked) fprintf(f, "%s\n", moveStr(r.mv).c_str());
+                fclose(f);
+            }
         }
-        std::stable_sort(replies.begin(), replies.end(), [](auto& a, auto& b) { return a.first > b.first; });
-        size_t won = 0, held = 0;
+        for (auto& r : ranked)
+            if (std::find(replies.begin(), replies.end(), r.mv) == replies.end()) replies.push_back(r.mv);
+        size_t won = 0, held = 0, rank = 0;
         bool all = envInt("PROVELINE_ALL", 0) != 0;
-        for (auto& [sc, m] : replies) {
+        for (Move m : replies) {
             if (held && !all) break;  // one reply that holds settles the line
+            rank++;
             std::string ms = moveStr(m);
             if (done.count(ms)) { won += done[ms] == "wins"; held += done[ms] == "holds"; continue; }
+            printf("reply %zu/%zu %s\n", rank, replies.size(), ms.c_str());
+            fflush(stdout);
             Pos a = s; a.play(m);
             std::string file = ms;
             for (char& ch : file) if (ch == ':' || ch == ',') ch = '_';
@@ -486,6 +543,44 @@ int main(int argc, char** argv) {
                replies.size() - won - held);
         if (held) printf("the attacker does not win this line\n");
         else if (won == replies.size()) printf("the attacker WINS this line\n");
+    } else if (mode == "uniquemoves") {
+        // snek uniquemoves <seconds> <top> <threads> <moves...> [-- <move>...]: the side to move's
+        // symmetry-unique moves, best first (the <top> best of a <seconds> engine search, then the
+        // evaluation's order), one per line: "<move> <the mover's win probability> search|eval", after
+        // a line "# position <position> moves <count> depth <search depth>". Moves listed after "--"
+        // are mapped to their representative among them: "map <move> <representative>" or
+        // "map <move> illegal".
+        if (argc < 6) { printf("usage: snek uniquemoves <seconds> <top> <threads> <moves...> [-- <move>...]\n"); return 1; }
+        double secs = std::atof(argv[2]);
+        int top = std::atoi(argv[3]), threads = std::atoi(argv[4]);
+        Pos s = Pos::start();
+        int i = 5;
+        for (; i < argc && std::string(argv[i]) != "--"; i++) {
+            Move m;
+            if (!parseMove(argv[i], m) || !s.legalMove(m)) { printf("illegal move %s\n", argv[i]); return 1; }
+            s.play(m);
+        }
+        int depth;
+        std::vector<RankedMove> ranked = movesBestFirst(s, secs, top, threads, &depth);
+        printf("# position %s moves %zu depth %d\n", posStr(s).c_str(), ranked.size(), depth);
+        for (auto& r : ranked) printf("%s %.4f %s\n", moveStr(r.mv).c_str(), r.prob, r.searched ? "search" : "eval");
+        std::map<uint64_t, Move> byKey;  // the position after a move, up to symmetry -> its representative
+        for (auto& r : ranked) {
+            Pos c = s; c.play(r.mv);
+            int t;
+            byKey[c.key(t)] = r.mv;
+        }
+        for (i++; i < argc; i++) {
+            Move m;
+            std::string rep = "illegal";
+            if (parseMove(argv[i], m) && s.legalMove(m)) {
+                Pos c = s; c.play(m);
+                int t;
+                auto it = byKey.find(c.key(t));
+                if (it != byKey.end()) rep = moveStr(it->second);
+            }
+            printf("map %s %s\n", argv[i], rep.c_str());
+        }
     } else if (mode == "worker") {
         // snek worker <host[:port]> [threads] [name]
         if (argc < 3) { printf("usage: snek worker <coordinator-ip[:port]> [threads] [name]\n"); return 1; }
