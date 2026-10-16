@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Centre Solve</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='-12 -12 24 24'%3E%3Cpolygon points='0,-11 9.5,-5.5 9.5,5.5 0,11 -9.5,5.5 -9.5,-5.5' fill='%23161b22'/%3E%3Cpolygon points='0,-5 4.3,-2.5 4.3,2.5 0,5 -4.3,2.5 -4.3,-2.5' fill='%23ef5350'/%3E%3C/svg%3E">
+  <script>
+    // The saved theme (dark by default) before first paint.
+    (function () {
+      var theme = null;
+      try { theme = localStorage.getItem('centre.theme'); } catch (e) { /* storage unavailable */ }
+      document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+    })();
+  </script>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg viewBox="-12 -12 24 24" aria-hidden="true">
+        <polygon points="0,-11 9.5,-5.5 9.5,5.5 0,11 -9.5,5.5 -9.5,-5.5" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".55"/>
+        <polygon points="0,-4.6 4,-2.3 4,2.3 0,4.6 -4,2.3 -4,-2.3" fill="var(--red)"/>
+        <polygon points="7.4,-8 9.5,-6.8 9.5,-4.4 7.4,-3.2 5.3,-4.4 5.3,-6.8" fill="var(--blue)"/>
+      </svg>
+      <span>Snekagon</span><span class="brand-sub">centre solve</span>
+    </div>
+    <div class="run-chip" id="run-chip" hidden></div>
+    <div class="header-tools">
+      <button type="button" class="icon-btn" id="theme-toggle" aria-label="Toggle theme"></button>
+      <span class="connection" id="connection" role="status"><span class="connection-dot" aria-hidden="true"></span><span class="connection-text">Connecting</span></span>
+    </div>
+  </header>
+
+  <main class="view" id="view">
+    <section class="waiting card" id="waiting" hidden>
+      <svg viewBox="-12 -12 24 24" aria-hidden="true">
+        <polygon points="0,-11 9.5,-5.5 9.5,5.5 0,11 -9.5,5.5 -9.5,-5.5" fill="none" stroke="var(--muted)" stroke-width="1"/>
+        <polygon points="0,-4.6 4,-2.3 4,2.3 0,4.6 -4,2.3 -4,-2.3" fill="var(--red)" opacity=".5"/>
+      </svg>
+      <h1>Waiting for the run</h1>
+      <p class="muted" id="waiting-text">No <code>state.json</code> yet. The page checks again every few seconds.</p>
+    </section>
+
+    <div id="dashboard" hidden>
+      <section class="card summary-card" id="summary" aria-label="Run summary">
+        <div class="summary">
+          <div class="verdict-block">
+            <div class="verdict-line"><span class="verdict-word" id="verdict-word"></span><span class="status-badge" id="run-status"></span></div>
+            <p class="verdict-text" id="verdict-text"></p>
+            <p class="stale-warning" id="stale" hidden></p>
+            <div class="run-meta" id="run-meta"></div>
+          </div>
+          <div class="tiles" id="stats"></div>
+        </div>
+        <div class="halves">
+          <div class="half-progress" id="red-progress"></div>
+          <div class="half-progress" id="blue-progress"></div>
+        </div>
+        <div class="alarm" id="alarm" role="alert" hidden></div>
+      </section>
+
+      <div class="main-grid">
+        <div class="main-col">
+          <section class="card" id="running-card" aria-label="Running now">
+            <div class="card-head"><h2><span class="pulse" id="running-pulse"></span>Running now</h2><span class="card-sub" id="running-sub"></span></div>
+            <div class="running-list" id="running"></div>
+          </section>
+
+          <section class="card red-card" aria-label="Red's half">
+            <div class="card-head">
+              <h2><span class="red-ink">Red's half</span> · blue cannot win</h2>
+              <span class="card-sub" id="red-sub"></span>
+            </div>
+            <p class="card-sub card-goal" id="red-goal"></p>
+            <div class="tile-grid" id="red-grid"></div>
+          </section>
+
+          <section class="card blue-card" aria-label="Blue's half">
+            <div class="card-head">
+              <h2><span class="blue-ink">Blue's half</span> · red cannot win</h2>
+              <span class="card-sub" id="blue-sub"></span>
+            </div>
+            <p class="card-sub card-goal" id="blue-goal"></p>
+            <div class="b1-history" id="b1-history"></div>
+            <div class="heat-grid" id="blue-grid"></div>
+            <div class="heat-axis"><span>red's strongest reply</span><span id="heat-axis-end">weakest</span></div>
+          </section>
+        </div>
+
+        <aside class="side-col">
+          <section class="card detail-card" id="detail" aria-label="Selected line">
+            <div class="card-head">
+              <h2 id="detail-head">Detail</h2>
+              <span class="status-badge" id="detail-status" hidden></span>
+            </div>
+            <div class="detail-empty" id="detail-empty">Select a line, a reply or a running piece.</div>
+            <div class="detail-body" id="detail-body" hidden>
+              <div class="detail-board-wrap" id="detail-board"></div>
+              <div class="detail-info">
+                <div class="detail-title" id="detail-title"></div>
+                <ol class="move-list" id="detail-moves"></ol>
+                <dl class="kv" id="detail-kv"></dl>
+              </div>
+            </div>
+            <div class="tail" id="tail" hidden>
+              <div class="tail-head"><span class="muted">Output <span class="mono" id="tail-file"></span></span><span class="muted" id="tail-size"></span></div>
+              <pre id="tail-text"></pre>
+            </div>
+          </section>
+        </aside>
+      </div>
+
+      <div class="bottom-grid">
+        <section class="card" aria-label="History">
+          <div class="card-head"><h2>Progress over time</h2><span class="card-sub">one point every 5 minutes</span></div>
+          <div class="charts" id="charts"></div>
+        </section>
+        <section class="card events-card" aria-label="Events">
+          <div class="card-head"><h2>Events</h2><span class="card-sub" id="events-sub"></span></div>
+          <ol class="events" id="events"></ol>
+        </section>
+      </div>
+    </div>
+  </main>
+  <div class="tooltip" id="tooltip" hidden></div>
+</body>
+</html>

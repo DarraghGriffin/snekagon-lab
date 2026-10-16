@@ -525,6 +525,25 @@ answer, whether it needed the full sweep), `running` (each process's moves, phas
 300 `events` and a `history` point per 5 minutes. Readers should open, read and close it at once: on
 Windows a reader that holds it open blocks the rename (the driver retries for 2 s, then skips that write).
 
+## Monitoring the centre-opening run (`tools/centre_monitor/`)
+
+A live dashboard of a centre run in the browser, served from the run directory the driver writes
+([tools/centre_monitor/CONTRACT.md](tools/centre_monitor/CONTRACT.md)):
+
+```bash
+python tools/centre_monitor/server.py --run <run dir>          # http://127.0.0.1:8770/  (--port N)
+python tools/centre_monitor/demo.py --run build/monitor/demo --advance   # a fake run that keeps moving
+```
+
+The server (Python standard library only, bound to 127.0.0.1) re-reads `state.json` only when it changes and answers
+unchanged polls with 304; the page polls every 4.5 s and redraws only what changed. It shows the verdict, elapsed
+time, thread-hours, ETA, busy threads and a progress bar per half; red's half as 172 mini boards (blue's reply to the
+centre, red's hold once known), hardest first; blue's half as a heat grid of red's 1589 replies in rank order; the
+running pieces with their position, phase and progress; a large board of the selected line with its move list and
+the tail of its output; charts of pieces settled and thread-hours over time; and the event feed. A result that
+breaks either half (a blue reply no red reply holds, a red reply no blue answer holds) is listed above everything
+else. Before the run starts the page waits for `state.json`.
+
 ## Tools
 
 | Command | Purpose |
@@ -601,6 +620,7 @@ Windows a reader that holds it open blocks the rename (the driver retries for 2 
 | `tools/fit_eval.py`, `tools/train_nn.py` | evaluation fitting, network training |
 | `tools/centre_solve.py` | resumable driver of the centre opening's proof (both halves) |
 | `tools/arena_stats.py` | match statistics |
+| `tools/centre_monitor/` | live dashboard of the centre-opening run: server, page, demo run, run-directory contract |
 | `data/` | solver-labelled positions (`labels_v*.csv`), weight files, `nn/` networks, `book2.txt` arena openings |
 | `ui/` | Node server + single-page UI |
 | `results/` | benchmark / arena / solve logs |
