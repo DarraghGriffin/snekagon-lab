@@ -644,9 +644,9 @@ struct Solver {
 
 enum SolveQuestion { EXACT, LOSS_TEST, WIN_TEST };
 // Parallel exact solve: root moves (symmetry-reduced, ordered by the learned
-// evaluation) are distributed over threads, each with its own solver/TT. Stops
-// as soon as a winning move is found. perMove receives the value of every root
-// move for the side to move (-9 = unknown).
+// evaluation) are distributed over threads, each with its own solver (killers reset
+// for every root move) and TT, or one shared TT. Stops as soon as a winning move is
+// found. perMove receives the value of every root move for the side to move (-9 = unknown).
 // question: EXACT values, or only whether the side to move loses (LOSS_TEST: every child is
 // a win test for the opponent; a root move is -1, or 0 for "does not lose"; stops at the first
 // move that does not lose) or wins (WIN_TEST: a root move is 1, or 0 for "does not win"; stops
@@ -710,6 +710,7 @@ inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int th
             size_t i = idx[k];
             if (val[i] != -9) continue;  // known from a previous run
             Pos c = root; c.play(mv[i]);
+            S.newPosition();  // killers from a sibling root move cost about 7% more nodes
             auto ts = std::chrono::steady_clock::now();
             double left = seconds - std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (left <= 0) break;
