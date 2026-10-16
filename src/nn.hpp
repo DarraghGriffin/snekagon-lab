@@ -106,8 +106,10 @@ inline void planesOf(const Pos& s, Planes& P) {
     boundsOf(s, P);
 }
 
-// The planes of child = s after the side to move places pl (legal), from s's planes P.
-inline void planesAfter(const Pos& s, const Planes& P, const Placement& pl, int piece, const Pos& child, Planes& Q) {
+// The planes of child = s after the side to move places pl (legal), from s's planes P (ub: the
+// child's snakeBounds upper bounds when the caller has them already).
+inline void planesAfter(const Pos& s, const Planes& P, const Placement& pl, int piece, const Pos& child, Planes& Q,
+                        const int* ub = nullptr) {
     int me = s.stm, op = me ^ 1;
     BB occ = s.own[0] | s.own[1] | pl.m, E = T.VALID & ~occ;
     BB own = s.own[me] | pl.m;
@@ -128,6 +130,12 @@ inline void planesAfter(const Pos& s, const Planes& P, const Placement& pl, int 
     Q.len[me] = (uint8_t)std::min<int>(lengthAfter(s, me, pl), LEN_CAP);
     Q.len[op] = P.len[op];
     Q.iso = P.iso & ~(pl.m | pl.nb);
+#if NN_UB
+    if (ub) {
+        for (int c = 0; c < 2; c++) Q.ub[c] = (uint8_t)std::min(ub[c], UB_CAP);
+        return;
+    }
+#endif
     boundsOf(child, Q);
 }
 

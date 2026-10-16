@@ -50,18 +50,14 @@ struct AbEntry {
     int16_t best;
 };
 
-// How the "nn" engine scores the leaves of its search (the network always orders the moves): by the
-// logistic evaluation, by the network, or by the mean of the two. NN_LEAVES=logistic|network|mean
-// overrides the engine's choice.
-enum class NnLeaves { Logistic, Network, Mean };
-inline NnLeaves nnLeaves(NnLeaves def) {
-    const char* v = getenv("NN_LEAVES");
-    if (!v) return def;
-    std::string s = v;
-    return s == "logistic" ? NnLeaves::Logistic : s == "network" ? NnLeaves::Network : s == "mean" ? NnLeaves::Mean : def;
+// How the "nn" engine evaluates positions (move ordering and leaves alike): by the network alone, or
+// by the mean of the network and the logistic evaluation (the default: the network alone is about
+// twice as fast but loses to ab2, the mean beats it; see README). NN_EVAL=network|mean overrides it.
+enum class NnEval { Network, Mean };
+inline NnEval nnEvalMode() {
+    const char* v = getenv("NN_EVAL");
+    return v && std::string(v) == "network" ? NnEval::Network : NnEval::Mean;
 }
-
-constexpr NnLeaves NN_DEFAULT_LEAVES = NnLeaves::Mean;
 
 inline int terminalScore(const Pos& s) {
     int d = s.L[s.stm] - s.L[s.stm ^ 1];
@@ -82,7 +78,7 @@ struct AbSearcher {
     // The network (the "nn" engine): the accumulators of the positions on the current search path,
     // each updated from its parent's.
     const nn::Net* net = nullptr;
-    NnLeaves leaves = NnLeaves::Network;
+    NnEval mode = NnEval::Network;
     struct NnLevel { nn::Planes P; nn::Accumulator A; };
     std::vector<NnLevel> nnPath = std::vector<NnLevel>(64);
     int lvl = 0;
@@ -111,32 +107,40 @@ struct AbSearcher {
         }
         return ab(s, depth, alpha, beta);
     }
-    // The leaf evaluation of s, the position at the current level of the path.
+    // The evaluation of s, the position at the current level of the path.
     int staticEval(const Pos& s) {
-        if (!net || leaves == NnLeaves::Logistic) return evaluate(s);
+        if (!net) return evaluate(s);
         int v = net->evaluate(nnPath[lvl].A, s.stm, s.ply);
-        return leaves == NnLeaves::Mean ? (v + evaluate(s)) / 2 : v;
+        return mode == NnEval::Mean ? (v + evaluate(s)) / 2 : v;
     }
     // The network's value of c = s after m (legal in s, the current level) for c's side to move,
     // from s's accumulator.
-    int netChild(const Pos& s, Move m, const Pos& c) {
+    int netChild(const Pos& s, Move m, const Pos& c, const int* ub = nullptr) {
         const NnLevel& L = nnPath[lvl];
         nn::Planes Q;
-        nn::planesAfter(s, L.P, m.pl(), m.piece(), c, Q);
+        nn::planesAfter(s, L.P, m.pl(), m.piece(), c, Q, ub);
         nn::Delta d;
         nn::deltaOf(L.P, Q, d);
         nn::Accumulator A;
         net->apply(L.A, d, A);
         return net->evaluate(A, c.stm, c.ply);
     }
-    // The value of c = s after m for c's side to move, as the move ordering (order) or the leaves
-    // (!order) score it.
-    int childValue(const Pos& s, Move m, bool order) {
+    // The value of c = s after m (legal in s, the current level) for c's side to move: the terminal
+    // score or the evaluation.
+    int childValue(const Pos& s, Move m) {
         Pos c = s; c.play(m);
         if (c.over()) return terminalScore(c);
         if (!net) return evaluate(c);
-        if (order || leaves == NnLeaves::Network) return netChild(s, m, c);
-        return leaves == NnLeaves::Mean ? (netChild(s, m, c) + evaluate(c)) / 2 : evaluate(c);
+        if (mode == NnEval::Network) return netChild(s, m, c);
+        int ub[2];  // the logistic evaluation's bounds are inputs of the network too
+        int lv = evaluateBounds(c, ub);
+        return (netChild(s, m, c, ub) + lv) / 2;
+    }
+    // The evaluation of a position from scratch (the root moves).
+    int rootEval(const Pos& c) {
+        if (!net) return evaluate(c);
+        int v = net->evaluate(c);
+        return mode == NnEval::Mean ? (v + evaluate(c)) / 2 : v;
     }
     // ab() of the child c = s after m, with the network path extended to it.
     int abChild(const Pos& s, Move m, const Pos& c, int depth, int alpha, int beta) {
@@ -207,7 +211,7 @@ struct AbSearcher {
             // order by 1-ply evaluation, keep the best `width`
             for (int i = 0; i < n; i++) {
                 if ((++nodes & 63) == 0 && checkAbort()) return 0;
-                if (net) sc[i] = -childValue(s, mv[i], true);
+                if (net) sc[i] = -childValue(s, mv[i]);
                 else { Pos c = s; c.play(mv[i]); sc[i] = c.over() ? -terminalScore(c) : -evaluate(c); }
                 if (mv[i].gid == ttMove) sc[i] += 10 * WIN;
                 else if (mv[i].gid == killer[ply][0] || mv[i].gid == killer[ply][1]) sc[i] += 200;
@@ -243,7 +247,7 @@ struct AbSearcher {
                 // the children are leaves: the network's values come straight from the parent's accumulator
                 nodes++;
                 if (checkAbort()) return 0;
-                v = -childValue(s, m, false);
+                v = -childValue(s, m);
             } else {
                 Pos c = s; c.play(m);
                 if (k == 0) v = -abChild(s, m, c, depth - 1, -beta, -alpha);
@@ -313,8 +317,8 @@ inline double scoreToWinProb(int score) {
 // subtrees of earlier ones, so proofs carry over).
 struct AbEngine {
     AbParams P;
-    const nn::Net* net = nullptr;  // the network ("nn" engine): move ordering, and leaves as `leaves` says
-    NnLeaves leaves = NnLeaves::Network;
+    const nn::Net* net = nullptr;  // the network ("nn" engine), else the logistic evaluation
+    NnEval mode = NnEval::Network;
     std::vector<std::unique_ptr<AbSearcher>> pool;
     std::shared_ptr<LTT> exactTT;
     std::vector<std::unique_ptr<Solver>> exactPool;
@@ -328,7 +332,7 @@ inline AbEngine& abEngine(int version) {
 // The network file named by an engine name: "nn" (the compiled-in network) or "nn:<file>".
 inline bool isNnEngine(const std::string& name) { return name == "nn" || name.rfind("nn:", 0) == 0; }
 inline std::string nnPath(const std::string& name) { return name.size() > 3 ? name.substr(3) : ""; }
-// The "nn" engine: ab2 with the network evaluation; one instance (state kept between moves) per network.
+// The "nn" engine: ab2 with the network in the evaluation; one instance (state kept between moves) per network.
 inline AbEngine& nnEngine(const std::string& name) {
     static std::mutex mu;
     static std::map<std::string, std::unique_ptr<AbEngine>> engines;
@@ -337,7 +341,7 @@ inline AbEngine& nnEngine(const std::string& name) {
     if (!e) {
         e = std::make_unique<AbEngine>(abParamsV2());
         e->net = nn::loadNet(nnPath(name));
-        e->leaves = nnLeaves(NN_DEFAULT_LEAVES);
+        e->mode = nnEvalMode();
     }
     return *e;
 }
@@ -498,7 +502,7 @@ inline std::vector<RootResult> rootMovesByEval(const Pos& root, AbSearcher& S) {
         int v;
         if (c.over()) v = -terminalScore(c);
         else if (S.exactKnown(c, v)) v = -v;
-        else v = S.net ? -S.net->evaluate(c) : -evaluate(c);
+        else v = -S.rootEval(c);
         cur[i].mv = mv[i]; cur[i].score = v; cur[i].exact = true; cur[i].depth = 1; cur[i].display = v;
     }
     std::stable_sort(cur.begin(), cur.end(), [](auto& a, auto& b) { return a.score > b.score; });
@@ -514,7 +518,7 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
     std::atomic<bool> stop{false};
     auto& pool = E.pool;  // reused between calls (TT warm)
     while ((int)pool.size() < threads) pool.emplace_back(new AbSearcher(P));
-    for (auto& S : pool) S->net = E.net, S->leaves = E.leaves;
+    for (auto& S : pool) S->net = E.net, S->mode = E.mode;
 
     AbAnalysis res;
     res.moves = rootMovesByEval(root, *pool[0]);

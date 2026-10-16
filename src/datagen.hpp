@@ -111,7 +111,7 @@ inline std::unique_ptr<AbEngine> makeEngine(const std::string& name) {
     if (isNnEngine(name)) {
         auto e = std::make_unique<AbEngine>(abParamsV2());
         e->net = nn::loadNet(nnPath(name));
-        e->leaves = nnLeaves(NN_DEFAULT_LEAVES);
+        e->mode = nnEvalMode();
         return e;
     }
     fprintf(stderr, "unknown engine %s\n", name.c_str());

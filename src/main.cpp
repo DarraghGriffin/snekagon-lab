@@ -803,14 +803,17 @@ int main(int argc, char** argv) {
         // snek firstwin <eval> <data.csv> <ply> <max>: for held-out won positions at <ply> in a datagen
         // file (games with id hash 0 mod 10, as tools/train_nn.py holds out), the rank of the first
         // winning move in the evaluation's order (each move solved exactly in that order).
-        // <eval>: "logistic", "nn" (compiled-in network) or "nn:<file>".
+        // <eval>: "logistic", "nn" (compiled-in network), "nn:<file>" or "mean:<file>".
         std::string ev = argv[2];
-        const nn::Net* net = ev == "logistic" ? nullptr : nn::loadNet(nnPath(ev));
+        bool mean = ev.rfind("mean:", 0) == 0;  // mean:<file>: the mean of that network and the logistic evaluation
+        const nn::Net* net = ev == "logistic" ? nullptr : nn::loadNet(mean ? ev.substr(5) : nnPath(ev));
         auto ordered = [&](const Pos& s) {
             std::vector<std::pair<double, Move>> r;
             for (Move m : uniqueRootMoves(s)) {
                 Pos c = s; c.play(m);
-                double v = c.over() ? -Solver::terminalValue(c) * 1000.0 : net ? -net->evaluate(c) / 100.0 : -learnedLogit(c);
+                double v = c.over() ? -Solver::terminalValue(c) * 1000.0
+                           : mean ? -(net->evaluate(c) / 100.0 + learnedLogit(c)) / 2
+                           : net ? -net->evaluate(c) / 100.0 : -learnedLogit(c);
                 r.push_back({v, m});
             }
             std::stable_sort(r.begin(), r.end(), [](auto& a, auto& b) { return a.first > b.first; });
