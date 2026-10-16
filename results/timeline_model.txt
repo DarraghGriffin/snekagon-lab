@@ -1,0 +1,68 @@
+blue side: 55 phase-2 steps (48 uniform, 7 hard), 14 phase-1 pilot steps; r2 per opening 15180 in all
+  node rate of blue-side units: 1.053 M/s in the phase-1 pilot (light load), 0.895 M/s in phase 2: phase-2 costs divided by 1.176
+  failed candidates: 14.4% of candidate thread-seconds (reused answers 8.1%)
+  uniform  n=48 censored 1  median 0.040  mean 0.057  max 0.330 th-h  CV 1.06  first candidate held 21  sweep needed 3  blue loses 0
+  hard     n= 7 censored 1  median 0.392  mean 0.353  max 0.733 th-h  CV 0.76  first candidate held 0  sweep needed 5  blue loses 3
+  per opening (light-load th-h per uniform step; r2 count):
+    1:5   N  1338  uniform n=4 mean 0.044 max 0.064  hard 0.461
+    1:6   N  1329  uniform n=4 mean 0.048 max 0.058  hard 0.036
+    1:7   N  1286  uniform n=4 mean 0.031 max 0.049  hard 0.033
+    1:16  N  1240  uniform n=4 mean 0.020 max 0.026  hard 0.392+
+    1:17  N  1195  uniform n=4 mean 0.046 max 0.114  hard 0.733
+    1:18  N  1217  uniform n=4 mean 0.043 max 0.103  hard 0.586
+    1:27  N  1201  uniform n=4 mean 0.042 max 0.089  hard 0.230
+    1:28  N  1316  uniform n=4 mean 0.154 max 0.330 (1 censored)  hard -
+    1:38  N  1490  uniform n=4 mean 0.075 max 0.156  hard -
+    1:39  N   608  uniform n=4 mean 0.054 max 0.067  hard -
+    1:49  N  1371  uniform n=4 mean 0.082 max 0.205  hard -
+    1:60  N  1589  uniform n=4 mean 0.043 max 0.050  hard -
+  reused answers tried 77, held 25; engine answers tried 40, held 22
+  lognormal fit to uniform steps (censored MLE): median 0.041 th-h, sigma 0.75, mean 0.054
+  censored U 1:28 4I:75,85,95,105: 0.33 th-h spent, sweep 105 of 887 refuted, 23.7 s per move recently: rest of the sweep 1.69 th-h
+  censored H 1:16 4I:17,28,39,50: 0.39 th-h spent, sweep 296 of 953 refuted, 17.8 s per move recently: rest of the sweep 1.07 th-h
+
+red side lines measured (cost in thread-hours, hold rank in the order used):
+  line_H1  4C:26,36,47,48     rating 0.171  cost   0.76  hold rank 2  replies settled 2
+  line_H2  4I:9,19,29,39      rating 0.168  cost   0.97 (censored)  hold rank None  replies settled 1
+  line_W1  3V:55,56,67        rating 0.028  cost   0.29  hold rank 1  replies settled 1
+  line_W2  3V:35,36,47        rating 0.044  cost   0.30  hold rank 1  replies settled 1
+  4A18     4A:18,19,30,41     rating 0.122  cost   0.37  hold rank 1  replies settled 1
+  settled  4B:16,27,28,39     rating 0.203  cost  13.00  hold rank 30 (evaluation order; thread counts inferred)
+  settled  3V:36,37,48        rating 0.164  cost  20.00  hold rank 20 (evaluation order; thread counts inferred)
+  settled  4A:51,52,63,74     rating 0.192  cost   7.10  hold rank 17 (evaluation order; thread counts inferred)
+  pre-registered prediction (prediction.txt) for line_W1: phase-1 model 5%/50%/95% = 0.90/2.58/5.1 th-h, P(h=1) 0.50; measured 0.34 th-h as run (0.29 at light load), hold rank 1
+  strata: 151 easy (rating < 0.164), 18 hard open replies
+
+blue side, phase-2 steps                     median     1113  90%      710 -     1832 thread-hours
+blue side, phase-2 + phase-1 pilot steps     median     1102  90%      739 -     1712 thread-hours
+red side, two-phase ratio estimate           median      282  90%      169 -      468 thread-hours
+red side, stratified mean                    median      232  90%      135 -      388 thread-hours
+red side, ratio, hard lines search-ordered only median       93  90%       69 -      152 thread-hours
+draw proof as planned (given a draw)         median     1411  90%      969 -     2159 thread-hours
+  blue side, censored steps at the cost spent       median    880  90%    700 -   1072
+  blue side, censored steps: pooled lognormal tail  median    911  90%    710 -   1156
+  blue side, censored steps: whole rest of the sweep median   1427  90%    712 -   2544
+  the 3 heaviest of 48 uniform samples carry 29% of the blue point estimate (spent cost): 1:28 4I:75,85,95,105 0.33+, 1:28 4I:85,95,105,115 0.22, 1:49 4B:16,25,26,35 0.20
+
+preferred blue replies: bad ['1:17', '1:18', '1:5']; unresolved (fraction of the sweep refuted, no survivor) {'1:16': 0.31}; held ['1:27', '1:6', '1:7']; untested ['1:28', '1:38', '1:39', '1:49', '1:60']
+P(preferred reply loses) per opening: mean 0.510 (90% 0.22-0.79); bad openings: mean 6.13, 90% 4-9; P(1:16 bad) 0.59
+red-win proof per b1: losing hard steps 0.46, 0.59, 0.73, 1.46 th-h (full sweeps), + U(0, 2) failed red replies x 0.051: mean 0.86 th-h; distinct b1 per opening {'1:5': 1200, '1:6': 2304, '1:7': 2276, '1:16': 1120, '1:17': 2146, '1:18': 1072, '1:27': 1043, '1:28': 2015, '1:38': 995, '1:39': 983, '1:49': 979, '1:60': 172}
+replacement reply 1:5 4A:61,72,82,92 against red's 4B:46,57,58,69: BLUE-LOSES, 0.94 th-h as run
+P(some open hard-rated centre reply wins for blue): mean 0.55 (Jeffreys prior, 0 wins in 4 completed hard lines, 17 hard replies left)
+  the phase-2 hard lines were picked by hand (p2/run_hlines.sh), not drawn at random: 4C:26,36,47,48 is 16 of 18 by rating, 4I:9,19,29,39 is 18 of 18 by rating; the top-rated 4A:39,40,51,62 (0.242) and 4A:28,29,40,51 (0.235) are untested
+given a draw: plan + both risks              median     3066  90%     1370 -     5578 thread-hours
+  given a draw and a centre reply winning for blue: median 3751; otherwise median 2033
+P(red wins) with w ~ U(0,1)   : 0.87; given a red win: median 1025  90% 256 - 1770 thread-hours
+P(red wins) with w ~ Beta(1,9): 0.44; given a red win: median 1219  90% 403 - 2289 thread-hours
+
+scenario table: thread-hours 5/50/95%, wall clock at the median (90% range), cloud cost at the median (90% range)
+  laptop = one 16-thread Ryzen 7 250; cores = AWS c7a cores at parallel efficiency U(0.6, 0.9); EUR = Hetzner AX162 packed
+  draw proof as planned (given a draw)                969   1411   2159 th-h | laptop   6.9 d (4.6-10.9) | 128 cores  0.7 d (0.5-1.1) | 1000 cores   2.2 h (1.4-3.5) | spot $33 (21-53) on-demand $112 (72-181) EUR 12
+  given a draw: + replacement replies                1245   2031   3930 th-h | laptop  10.1 d (6.0-19.6) | 128 cores  1.0 d (0.6-2.0) | 1000 cores   3.2 h (1.8-6.3) | spot $48 (28-95) on-demand $162 (94-322) EUR 18
+  given a draw: + red half moved                     2144   3087   4505 th-h | laptop  15.2 d (10.3-23.1) | 128 cores  1.6 d (1.0-2.4) | 1000 cores   4.8 h (3.1-7.5) | spot $72 (47-113) on-demand $245 (161-383) EUR 27
+  given a draw: mixture of both risks                1370   3066   5578 th-h | laptop  15.1 d (6.7-28.1) | 128 cores  1.5 d (0.7-2.9) | 1000 cores   4.7 h (2.1-9.0) | spot $71 (31-136) on-demand $240 (107-463) EUR 27
+  given a red win (w ~ U(0,1))                        256   1025   1770 th-h | laptop   5.0 d (1.3-8.8) | 128 cores  0.5 d (0.1-0.9) | 1000 cores   1.6 h (0.4-2.9) | spot $24 (6-43) on-demand $80 (20-147) EUR 9
+  given a red win (w ~ Beta(1,9))                     403   1219   2289 th-h | laptop   6.0 d (2.0-11.3) | 128 cores  0.6 d (0.2-1.2) | 1000 cores   1.9 h (0.6-3.6) | spot $28 (9-55) on-demand $96 (32-186) EUR 11
+  unconditional, w ~ U(0,1)                           270   1100   3379 th-h | laptop   5.4 d (1.3-16.8) | 128 cores  0.5 d (0.1-1.7) | 1000 cores   1.7 h (0.4-5.2) | spot $25 (6-79) on-demand $87 (21-268) EUR 10
+  unconditional, w ~ Beta(1,9)                        696   1896   4891 th-h | laptop   9.3 d (3.4-24.6) | 128 cores  1.0 d (0.3-2.6) | 1000 cores   3.0 h (1.1-7.9) | spot $44 (16-119) on-demand $151 (54-407) EUR 17
+  shares of the draw proof at the median: blue half 80%, red half 20%
