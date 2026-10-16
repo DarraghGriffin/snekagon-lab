@@ -13,13 +13,15 @@ Value target, for the side to move (draws count 1/2):
 Censored rows (the exact label ran out of time) get the blended target: they are not dropped.
 Ranking loss: the exactly solved siblings (kind c rows and the game's own position at the same ply)
 are compared in pairs: a child that is better for the parent should get the lower value.
-Augmentation: one of the 12 hex symmetries per mini-batch. Hold-out: every game whose id hash is
-0 mod 10. Output: the int16 file the engine loads (nn.hpp Net::loadBytes).
+Augmentation: one of the 12 hex symmetries per mini-batch. Hold-out (held_out): every game whose id,
+offset by the file's position in --data times 10^12, hashes to 0 mod 10. Output: the int16 file the
+engine loads (nn.hpp Net::loadBytes).
 """
 import argparse, os, struct, subprocess, sys, time
 import numpy as np
 
 HIDDEN, BUCKETS, QA, QB = 128, 16, 255, 128
+HOLDOUT_FILE_STRIDE = 10**12  # game ids restart in every datagen file; Data offsets them by file index
 
 
 def run_features(snek, csv):
@@ -93,7 +95,7 @@ class Data:
                 score = np.zeros(len(rows), int)
                 result = exact.copy()
             fs.append(dict(raw=raw, s0=s0[ok] + offs, sl=sl[ok], o0=o0[ok] + offs, ol=ol[ok], logit=logit[ok],
-                           game=game[ok] + fi * 10**12, ply=colv('ply', 0)[ok], exact=exact[ok], score=score[ok],
+                           game=game[ok] + fi * HOLDOUT_FILE_STRIDE, ply=colv('ply', 0)[ok], exact=exact[ok], score=score[ok],
                            result=result[ok], kind=kind[ok], leaf=leaf[ok]))
             offs += len(raw)
             raws.append(raw)
@@ -220,6 +222,11 @@ def bucket_of(ply):
     return np.minimum(ply, BUCKETS - 1)
 
 
+def held_out(game):
+    """The test split, by offset game id (Data.game); `snek firstwin` selects with the same rule (heldOutGame)."""
+    return (game * 2654435761 % 2**32) % 10 == 0
+
+
 def logloss(z, y):
     p = 1 / (1 + np.exp(-np.clip(z, -30, 30)))
     return -(y * np.log(np.clip(p, 1e-9, 1)) + (1 - y) * np.log(np.clip(1 - p, 1e-9, 1)))
@@ -265,7 +272,7 @@ def main():
     NIN = len(sym) // 12
     perms = sym.reshape(12, NIN)
     D = Data(a.snek, a.data, a.lam)
-    test = (D.game * 2654435761 % 2**32) % 10 == 0
+    test = held_out(D.game)
     if a.report_only:
         test[:] = True
     use = D.ply <= a.max_ply

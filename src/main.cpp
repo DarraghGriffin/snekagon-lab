@@ -802,9 +802,11 @@ int main(int argc, char** argv) {
     } else if (mode == "evalrank" || mode == "firstwin") {
         // snek evalrank <eval> <move> <moves...>: the rank of <move> among the side to move's
         // (symmetry-unique) moves in the evaluation's order, as proveline and refute order them.
-        // snek firstwin <eval> <data.csv> <ply> <max>: for held-out won positions at <ply> in a datagen
-        // file (games with id hash 0 mod 10, as tools/train_nn.py holds out), the rank of the first
-        // winning move in the evaluation's order (each move solved exactly in that order).
+        // snek firstwin <eval> <data.csv> <ply> <max> <file index>: for won positions at <ply> in a
+        // datagen file that the trainer held out, the rank of the first winning move in the
+        // evaluation's order (each move solved exactly in that order). <file index> is the file's
+        // position in the network's tools/train_nn.py --data list (heldOutGame); a file the network
+        // was not trained on has no training games, and any index selects a tenth of it.
         // <eval>: "logistic", "nn" (compiled-in network), "nn:<file>" or "mean:<file>".
         std::string ev = argv[2];
         bool mean = ev.rfind("mean:", 0) == 0;  // mean:<file>: the mean of that network and the logistic evaluation
@@ -836,8 +838,9 @@ int main(int argc, char** argv) {
             printf("not found among %zu moves\n", r.size());
             return 1;
         }
+        if (argc < 7) { fprintf(stderr, "usage: snek firstwin <eval> <data.csv> <ply> <max> <file index>\n"); return 1; }
         std::ifstream in(argv[3]);
-        int ply = std::atoi(argv[4]), maxPos = std::atoi(argv[5]);
+        int ply = std::atoi(argv[4]), maxPos = std::atoi(argv[5]), fileIndex = std::atoi(argv[6]);
         std::string line;
         std::getline(in, line);
         Solver S(22);
@@ -850,7 +853,7 @@ int main(int argc, char** argv) {
             while (std::getline(ss, c, ',')) f.push_back(c);
             if (f.size() != 11 || f[0] != "g" || std::atoi(f[2].c_str()) != ply || f[5] != "1") continue;
             long long game = std::atoll(f[1].c_str());
-            if ((uint64_t)game * 2654435761ULL % (1ULL << 32) % 10 != 0) continue;  // held-out games only
+            if (!heldOutGame(game, fileIndex)) continue;
             Pos s;
             if (!parsePosStr(f[10], s)) continue;
             S.clear();

@@ -150,6 +150,16 @@ inline std::string csvMove(Move m) {
 // kind l = a search leaf three plies below a game position (score from a short search).
 inline void printDatagenHeader(FILE* f) { fprintf(f, "kind,game,ply,stm,score,exact,result,margin,flag,move,pos\n"); }
 
+// The hold-out rule of tools/train_nn.py (held_out there): game ids restart in every datagen file,
+// so the trainer offsets them by the file's position in its --data list times 10^12 and holds out
+// the games whose offset id hashes to 0 mod 10. The same file is held out differently at another
+// position in the list.
+constexpr uint64_t HOLDOUT_FILE_STRIDE = 1000000000000ULL;
+inline bool heldOutGame(long long game, int fileIndex) {
+    uint64_t id = (uint64_t)game + (uint64_t)fileIndex * HOLDOUT_FILE_STRIDE;
+    return id * 2654435761ULL % (1ULL << 32) % 10 == 0;
+}
+
 template <class MakeEngine>
 inline void runDatagen(const DatagenConfig& C, FILE* out, MakeEngine makeEngine) {
     std::mutex mu;
