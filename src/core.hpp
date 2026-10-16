@@ -8,6 +8,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,7 @@ constexpr int DR[6] = {0, -1, -1, 0, 1, 1};
 // Shapes read off the print & play sheet. Pieces are double-sided (may flip).
 enum { P1 = 0, P2, P3I, P3V, P4I, P4A, P4B, P4C };
 inline const char* PNAME[NPIECE] = {"1", "2", "3I", "3V", "4I", "4A", "4B", "4C"};
-inline const int PIECE_CELLS[NPIECE] = {1, 2, 3, 3, 4, 4, 4, 4};
+constexpr int PIECE_CELLS[NPIECE] = {1, 2, 3, 3, 4, 4, 4, 4};
 inline const std::vector<std::pair<int, int>> PSHAPE[NPIECE] = {
     {{0, 0}},
     {{0, 0}, {1, 0}},
@@ -60,6 +61,7 @@ struct Placement {
     BB nb;     // cells adjacent to the piece (excluding the piece)
     uint8_t c[4];
     uint8_t n;
+    uint8_t piece;
     int gid;   // global placement id (for history tables / symmetry maps)
 };
 
@@ -82,7 +84,8 @@ struct Tables {
     int cells[NCELLS];
     int perm[NSYM][NIDX];  // cell -> transformed cell
     int inv[NSYM];
-    std::vector<Placement> PL[NPIECE];
+    std::vector<Placement> placements;      // every placement, by gid (piece by piece)
+    std::span<const Placement> PL[NPIECE];  // the placements of each piece
     std::vector<Orient> OR;
     int orBegin[NPIECE + 1];
     std::vector<std::pair<int, int>> gidInfo;  // gid -> (piece, index)
@@ -164,9 +167,12 @@ inline void initTables() {
     // orientations + placements (placement order = orientation-major, anchors ascending;
     // the bit-parallel generator enumerates in exactly the same order)
     T.gidInfo.clear();
+    T.placements.clear();
     T.OR.clear();
+    int plBegin[NPIECE + 1];
     for (int p = 0; p < NPIECE; p++) {
         T.orBegin[p] = (int)T.OR.size();
+        plBegin[p] = (int)T.placements.size();
         std::vector<std::vector<std::pair<int, int>>> ors;
         for (int t = 0; t < NSYM; t++) {
             std::vector<std::pair<int, int>> o;
@@ -176,7 +182,6 @@ inline void initTables() {
             for (auto& c : o) { c.first -= b0.first; c.second -= b0.second; }
             if (std::find(ors.begin(), ors.end(), o) == ors.end()) ors.push_back(o);
         }
-        T.PL[p].clear();
         for (auto& o : ors) {
             Orient od{};
             od.piece = p;
@@ -208,6 +213,7 @@ inline void initTables() {
             for (int i = 0; i < NIDX; i++) { od.gidAt[i] = -1; od.nextTo[i] = 0; }
             for (int c : T.cells) {
                 Placement pl{};
+                pl.piece = (uint8_t)p;
                 bool ok = true;
                 for (auto [dq, dr] : o) {
                     int q = qOf(c) + dq, r = rOf(c) + dr;
@@ -220,13 +226,15 @@ inline void initTables() {
                 pl.gid = (int)T.gidInfo.size();
                 od.gidAt[c] = (int16_t)pl.gid;
                 for (BB nb = pl.nb; nb; nb &= nb - 1) od.nextTo[lsb(nb)] |= bit(c);
-                T.gidInfo.push_back({p, (int)T.PL[p].size()});
-                T.PL[p].push_back(pl);
+                T.gidInfo.push_back({p, (int)T.placements.size() - plBegin[p]});
+                T.placements.push_back(pl);
             }
             T.OR.push_back(od);
         }
     }
     T.orBegin[NPIECE] = (int)T.OR.size();
+    plBegin[NPIECE] = (int)T.placements.size();
+    for (int p = 0; p < NPIECE; p++) T.PL[p] = std::span<const Placement>(T.placements).subspan(plBegin[p], plBegin[p + 1] - plBegin[p]);
     T.NGID = (int)T.gidInfo.size();
     // symmetry map on placements
     T.gidSym.assign(T.NGID, {});
@@ -261,8 +269,8 @@ inline void initTables() {
 struct Move {
     int16_t gid = -1;  // -1 = pass
     bool isPass() const { return gid < 0; }
-    int piece() const { return T.gidInfo[gid].first; }
-    const Placement& pl() const { auto [p, i] = T.gidInfo[gid]; return T.PL[p][i]; }
+    int piece() const { return T.placements[gid].piece; }
+    const Placement& pl() const { return T.placements[gid]; }
     bool operator==(const Move& o) const { return gid == o.gid; }
 };
 
@@ -515,9 +523,9 @@ inline int longest(BB b) {
     return best;
 }
 inline int remainingCells(uint8_t av) {
-    int s = 0;
-    for (int p = 0; p < NPIECE; p++) if (av >> p & 1) s += PIECE_CELLS[p];
-    return s;
+    static_assert(PIECE_CELLS[P1] == 1 && PIECE_CELLS[P2] == 2 && PIECE_CELLS[P3I] == 3 && PIECE_CELLS[P3V] == 3 && PIECE_CELLS[P4I] == 4 &&
+                  PIECE_CELLS[P4C] == 4);
+    return (av & 1) + (av & 2) + 3 * __builtin_popcount(av & 0x0C) + 4 * __builtin_popcount(av & 0xF0);
 }
 inline int pieceCount(uint8_t av) { return __builtin_popcount(av); }
 
@@ -747,7 +755,7 @@ struct OnePlayer {
                 while (gr) {
                     int anchor = lsb(gr);
                     gr &= gr - 1;
-                    const Placement& pl = T.PL[p][T.gidInfo[od.gidAt[anchor]].second];
+                    const Placement& pl = T.placements[od.gidAt[anchor]];
                     // the piece joins P and every old snake it touches
                     BB P2 = P | pl.m;
                     bool lower = false;
@@ -823,7 +831,7 @@ struct OnePlayer {
                 while (anchors) {
                     int anchor = lsb(anchors);
                     anchors &= anchors - 1;
-                    const Placement& pl = T.PL[p][T.gidInfo[od.gidAt[anchor]].second];
+                    const Placement& pl = T.placements[od.gidAt[anchor]];
                     int r = dfs(pl.m, own | pl.m, pl.m, higher, lsb(shapeOf(pl.m).ends), false);
                     if (r == 1) return 1;
                     if (r < 0) result = -1;

@@ -173,9 +173,8 @@ struct Solver {
         if (gid < 0 || n >= MAX_THREATS || nTried >= MAX_TRIED) return;
         for (int i = 0; i < nTried; i++) if (tried[i] == gid) return;
         tried[nTried++] = gid;
-        auto [p, idx] = T.gidInfo[gid];
-        const Placement& b = T.PL[p][idx];
-        int v = threatValue(s, b, p);
+        const Placement& b = T.placements[gid];
+        int v = threatValue(s, b, b.piece);
         if (exact && (v == 0 || v == 1)) {
             int me = s.stm, opp = me ^ 1;
             int bonus = me == 0 ? RED_BONUS : -RED_BONUS;
