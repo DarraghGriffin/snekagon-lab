@@ -350,6 +350,41 @@ bound adds 0.4 % of cutoffs, independent regions (sums of games) occur at 0.1–
 anyway (the score is a maximum, and the regions share one piece supply), and parity arguments fail because the
 cell graph has triangles.
 
+### One table per sweep, and the hot paths
+
+A sweep solves hundreds of sibling positions in a row. All of its solves, in both passes and every thread, share
+one transposition table kept from unit to unit (`SOLVER_SWEEP_TT`, 2^25 entries, 512 MB per process); only the
+killer moves and the one-player memo are reset for each position (`Solver::newPosition`), since killers carried
+over from another position are tried first and cost 13–28 % more nodes. `parallelSolve` (pass 2, which is all
+of a blue's-half step whose known answer holds) resets them before every root move, and the distributed worker
+works like a sweep. A table entry also carries a 32-bit check of the position: the key bits that pick the bucket
+verify nothing, and a 2^25-entry table would otherwise take one position for another about once in 2^40
+probes, about once in a run of 10^12 nodes. Measured on the shared laptop (node counts exact, seconds
+approximate), before and after:
+
+| | before | after |
+|---|---|---|
+| the whole `hold_4C26_4A58` line, `REFUTE_SEARCH=0 snek refute 3` from an empty log | 395.4 M nodes in the refutations, 1030 unit-s, 436 s wall | 314.4 M (−20.5 %), 824 unit-s, 363 s wall |
+| its first 200 units | 61.3 M nodes, 73 s wall | 59.9 M, 71 s |
+| a blue's-half step (red `4A:55,56,67,78`, blue's `4C:92,103,112,113` holds; `REFUTE_LOSS=1 REFUTE_FIRST`, 1 thread, 6 runs each, back to back) | 48.7 s | 42.2 s (1.15x); the proof takes 15.23 M nodes, 16.40 M with killers kept across root moves |
+
+Every verdict is the same as in `results/`: all 1057 moves of the line refuted, and in a fresh `REFUTE_LOSS=1`
+sweep of `hold_4C40_draw` blue's `4A:49,59,70,81` holds after 60 refutations, as in its log. The saving grows
+with the units already solved (the first 200 units save 2 %), so long sweeps gain most.
+
+The hot paths only got faster where nothing else changes: with `BENCH_FRESH=1` single-thread `benchset` on the
+four `bench/ply5_*` sets and 22 units of the line, and `snek solvebench 6 12 3600 1` and `5 12`, every value and
+node count is identical, and `snek verify 3000` passes. The placements in one array by id (one lookup per
+`Move::pl()` instead of two) gave 1.046x, and fetching the next child's table entry while a child is searched
+1.016x (1.013x on the step above): 1.050x together, as thread-seconds of 6 back-to-back pairs of 1-thread runs
+(win tests on the 22 units, exact values on `ply5_blue_wins.txt`). Tried and dropped, the same way: a counting
+sort of the growth bounds' extensions (1.00x), early exits in the move generator's rules (1.00x, slower on
+random positions), each shifted bitboard computed once per offset for all orientations (0.97x), `-O2` (0.88x),
+`-funroll-loops` (0.99x), `-fno-exceptions -fno-rtti` (1.00x) and profile-guided builds (`-fprofile-generate`
+/ `-fprofile-use`, trained on other units, a solvebench and a step: 0.965x, 0.963x without unrolling and
+peeling). The time is spread over the one-player questions, the growth and cluster bounds, the evaluation and
+the move generator, each already bit-parallel, so there is no single hot spot left to rewrite.
+
 ### QBF and SAT
 
 A QBF encoding of Snekagon positions (an experiment outside the repository; DepQBF and Bloqqer) gave the
