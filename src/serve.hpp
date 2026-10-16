@@ -112,7 +112,13 @@ static Analysis analyzeAb(const Pos& s, double seconds, int threads, Solver& sol
     return a;
 }
 
+// The default engine: nn (it beat ab2 at 0.3 and 1 s per move, see README); ab2 in the WebAssembly build,
+// where the network runs without AVX2. The UI selects its engine itself (`engine ab2`).
+#ifdef __EMSCRIPTEN__
 static std::string g_engine = "ab2";
+#else
+static std::string g_engine = "nn";
+#endif
 static Analysis analyze(const Pos& s, double seconds, int threads, Solver& solver, const std::string& engine = g_engine, int multipv = 1) {
     if (engine == "mcts") return analyzeMcts(s, seconds, threads, solver);
     if (isNnEngine(engine)) return analyzeAb(s, seconds, threads, solver, multipv, nnEngine(engine), false, "nn");

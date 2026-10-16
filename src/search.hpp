@@ -2,10 +2,10 @@
 // exact snake-length bounds as hard cutoffs, the exact solver once few pieces are
 // left, forward pruning (best-N by 1-ply eval) at inner nodes, parallel over root
 // moves with multi-PV so the UI gets real scores for the top moves.
-// Two configurations: "ab" (the first version) and "ab2", which adds exact verdicts on
-// the root moves once at most 10 pieces are left (games between these engines are
-// usually decided by plies 5-6, where the solver can tell winning moves apart within a
-// second) and uses the whole move time for the search.
+// Configurations: "ab" (the first version); "ab2", which adds exact verdicts on the root
+// moves once at most 10 pieces are left (games between these engines are usually decided
+// by plies 5-6, where the solver can tell winning moves apart within a second) and uses the
+// whole move time for the search; and "nn", ab2 with the network of nn.hpp in its evaluation.
 #pragma once
 #include <atomic>
 #include <chrono>
