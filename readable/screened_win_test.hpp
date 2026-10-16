@@ -29,7 +29,7 @@ class ScreenedWinTest {
     // Settings (environment variables override them for experiments).
     int screenFromPieces = envInt("PNS_SCREEN_REM", 10);  // screen attacker nodes with at least this many pieces left
     int screenedMoves = envInt("PNS_CANDIDATES", 8);       // moves screened per node
-    uint64_t hardReplyNodes = envInt("PNS_HARD", 1000);    // a reply with 8 pieces left is hard above this many nodes
+    uint64_t hardReplyNodes = envInt("PNS_HARD", 300);     // a reply with 8 pieces left is hard above this many nodes
     uint64_t sampleSeed = envInt("PNS_SEED", 0);           // other samples (to measure their spread)
     bool trace = envInt("PNS_TRACE", 0) != 0;              // print every screen
 

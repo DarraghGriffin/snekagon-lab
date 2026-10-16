@@ -24,7 +24,7 @@ struct PnSearch {
     uint64_t probes = 0, screens = 0, pnNodes = 0;
     int screenRem = envInt("PNS_SCREEN_REM", 10);    // screen attacker nodes with at least this many pieces left
     int candidates = envInt("PNS_CANDIDATES", 8);    // moves screened per node
-    uint64_t hardBudget = envInt("PNS_HARD", 1000);  // a reply with 8 pieces left is hard above this
+    uint64_t hardBudget = envInt("PNS_HARD", 300);   // a reply with 8 pieces left is hard above this many nodes
     uint64_t sampleSeed = envInt("PNS_SEED", 0);      // other samples (to measure their spread)
     static constexpr int ROUNDS = 3;
     static constexpr int SAMPLES[ROUNDS] = {8, 8, 16};  // replies probed per move and round
