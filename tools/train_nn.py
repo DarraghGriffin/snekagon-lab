@@ -14,8 +14,11 @@ Censored rows (the exact label ran out of time) get the blended target: they are
 Ranking loss: the exactly solved siblings (kind c rows and the game's own position at the same ply)
 are compared in pairs: a child that is better for the parent should get the lower value.
 Augmentation: one of the 12 hex symmetries per mini-batch. Hold-out (held_out): every game whose id,
-offset by the file's position in --data times 10^12, hashes to 0 mod 10. Output: the int16 file the
-engine loads (nn.hpp Net::loadBytes).
+offset by the file's position in --data times 10^12, hashes to 0 mod 10. The test report gives the
+log-loss on exact-label rows and on blended-target rows apart: the network is trained to fit the
+blended target (search score and game result, the score partly from searches with earlier networks)
+and the logistic evaluation is not, so only exact rows compare the two fairly. Output: the int16 file
+the engine loads (nn.hpp Net::loadBytes).
 """
 import argparse, os, struct, subprocess, sys, time
 import numpy as np
@@ -227,6 +230,17 @@ def held_out(game):
     return (game * 2654435761 % 2**32) % 10 == 0
 
 
+def game_bootstrap(d, games, rng, n=1000):
+    """95% interval of the mean of d, resampling whole games."""
+    ug, inv = np.unique(games, return_inverse=True)
+    s, c = np.bincount(inv, d), np.bincount(inv)
+    means = []
+    for _ in range(n):
+        w = np.bincount(rng.integers(len(ug), size=len(ug)), minlength=len(ug))
+        means.append((w * s).sum() / (w * c).sum())
+    return np.percentile(means, [2.5, 97.5])
+
+
 def logloss(z, y):
     p = 1 / (1 + np.exp(-np.clip(z, -30, 30)))
     return -(y * np.log(np.clip(p, 1e-9, 1)) + (1 - y) * np.log(np.clip(1 - p, 1e-9, 1)))
@@ -344,16 +358,32 @@ def main():
         report(f'epoch {ep + 1}')
     z = report('final')
     # "mean": the mean of the network's and the logistic evaluation's logits (the nn engine's evaluation)
-    print('test by ply: n, logloss network / logistic / mean, accuracy network / logistic / mean (decisive exact rows)')
-    for p in range(0, a.max_ply + 1):
-        m = D.ply[te] == p
+    yt, zl, pt = D.y[te], D.logit[te], D.ply[te]
+    zm = (z + zl) / 2
+    ln, ll, lm = logloss(z, yt), logloss(zl, yt), logloss(zm, yt)
+    brng = np.random.default_rng(11)
+    print('test by ply. Exact-label rows: n, logloss network / logistic / mean, network - logistic and mean - '
+          'logistic [95% game bootstrap], accuracy network / logistic / mean on decisive rows. Blended-target rows: '
+          'n, logloss network / logistic / mean')
+    for lo, hi in [(p, p) for p in range(a.max_ply + 1)] + [(4, 6), (7, a.max_ply)]:
+        m = (pt >= lo) & (pt <= hi)
+        me, mb = m & D.known[te], m & ~D.known[te]
         if not m.sum():
             continue
-        yy = D.y[te][m]; zn = z[m]; zl = D.logit[te][m]; zm = (zn + zl) / 2
-        ex = D.known[te][m] & (yy != 0.5)
-        acc = lambda q: ((q[ex] > 0) == (yy[ex] > 0.5)).mean() if ex.sum() else float('nan')
-        print(f'  ply {p:2d} n={m.sum():6d} exact={ex.sum():6d}  {logloss(zn, yy).mean():.4f} {logloss(zl, yy).mean():.4f} '
-              f'{logloss(zm, yy).mean():.4f}  {acc(zn):.3f} {acc(zl):.3f} {acc(zm):.3f}')
+        line = f'  ply {lo:2d}   ' if lo == hi else f'  ply {lo:2d}-{hi:<2d}'
+        if me.sum():
+            qn = game_bootstrap(ln[me] - ll[me], D.game[te][me], brng)
+            qm = game_bootstrap(lm[me] - ll[me], D.game[te][me], brng)
+            dec = me & (yt != 0.5)
+            acc = lambda v: ((v[dec] > 0) == (yt[dec] > 0.5)).mean() if dec.sum() else float('nan')
+            line += (f' exact n={me.sum():6d}  {ln[me].mean():.4f} {ll[me].mean():.4f} {lm[me].mean():.4f}  '
+                     f'{ln[me].mean() - ll[me].mean():+.4f} [{qn[0]:+.4f}, {qn[1]:+.4f}]  '
+                     f'{lm[me].mean() - ll[me].mean():+.4f} [{qm[0]:+.4f}, {qm[1]:+.4f}]  {acc(z):.3f} {acc(zl):.3f} {acc(zm):.3f}')
+        else:
+            line += f' exact n={0:6d}' + ' ' * 104
+        if mb.sum():
+            line += f'  | blended n={mb.sum():6d}  {ln[mb].mean():.4f} {ll[mb].mean():.4f} {lm[mb].mean():.4f}'
+        print(line)
     # sibling ranking on held-out groups: share of correctly ordered pairs
     tg = [g for g in D.groups if test[g[0]]]
     if tg:
