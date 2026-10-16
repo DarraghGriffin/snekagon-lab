@@ -1,15 +1,16 @@
 // Network evaluation for the "nn" engine: an efficiently updatable perspective network
 // (NNUE style), int16 with AVX2.
 //
-// Inputs, from one player's perspective ("me"), all local functions of the board so that a move
-// changes only the cells it covers and their neighbourhood:
+// Inputs, from one player's perspective ("me"), local functions of the board (a move changes only
+// the cells it covers and their neighbourhood) except for the bounds:
 //   per player (mine, then the opponent's), one plane of 91 cells each:
 //     full   own cells with 2 own neighbours (snake body, can never be touched again)
 //     end    the other own cells (snake ends and single cells)
 //     front  empty cells next to an own end that the player may still grow into
 //     dead   empty cells next to an own full cell (the player can never occupy them)
 //   iso      empty cells next to no tile (where a new snake can start)
-//   the pieces each player has left (8 + 8) and each player's longest snake (one-hot, capped).
+//   the pieces each player has left (8 + 8), and one-hot (capped) each player's longest snake and
+//   the upper bound of its final snake (snakeBounds).
 // Both perspectives share the first layer: accumulator acc[p] = b1 + sum of the rows of p's active
 // inputs, kept for both players and updated from the parent position by the inputs that changed.
 // Output: SCReLU(acc[side to move]) and SCReLU(acc[opponent]) times the output weights of the
@@ -40,16 +41,9 @@ constexpr int LEN_CAP = 24;  // longest snake one-hot: 0..LEN_CAP (longer counts
 constexpr int F_MINE = 0, F_OPP = N_PLAYER_PLANES * NC, F_ISO = 2 * N_PLAYER_PLANES * NC;
 constexpr int F_PIECES = F_ISO + NC;              // my pieces (8), then the opponent's (8)
 constexpr int F_LEN = F_PIECES + 2 * NPIECE;      // my longest snake (LEN_CAP + 1), then the opponent's
-#ifndef NN_UB
-#define NN_UB 1
-#endif
-#if NN_UB
 constexpr int UB_CAP = 25;                        // upper bound of the final snake (snakeBounds), one-hot
 constexpr int F_UB = F_LEN + 2 * (LEN_CAP + 1);   // mine (UB_CAP + 1), then the opponent's
 constexpr int N_INPUTS = F_UB + 2 * (UB_CAP + 1);
-#else
-constexpr int N_INPUTS = F_LEN + 2 * (LEN_CAP + 1);
-#endif
 constexpr int HIDDEN = 128;
 constexpr int BUCKETS = 16;                       // output bucket = ply (capped)
 constexpr int QA = 255, QB = 128;
@@ -79,15 +73,11 @@ struct Planes {
 };
 
 inline void boundsOf(const Pos& s, Planes& P) {
-#if NN_UB
     for (int c = 0; c < 2; c++) {
         int lb, ub;
         snakeBounds(s, c, lb, ub);
         P.ub[c] = (uint8_t)std::min(ub, UB_CAP);
     }
-#else
-    P.ub[0] = P.ub[1] = 0;
-#endif
 }
 
 inline void planesOf(const Pos& s, Planes& P) {
@@ -130,12 +120,10 @@ inline void planesAfter(const Pos& s, const Planes& P, const Placement& pl, int 
     Q.len[me] = (uint8_t)std::min<int>(lengthAfter(s, me, pl), LEN_CAP);
     Q.len[op] = P.len[op];
     Q.iso = P.iso & ~(pl.m | pl.nb);
-#if NN_UB
     if (ub) {
         for (int c = 0; c < 2; c++) Q.ub[c] = (uint8_t)std::min(ub[c], UB_CAP);
         return;
     }
-#endif
     boundsOf(child, Q);
 }
 
@@ -149,9 +137,7 @@ inline void forEachInput(const Planes& P, int p, F&& f) {
         for (int q = 0; q < NPIECE; q++)
             if (P.avail[c] >> q & 1) f(F_PIECES + (c == p ? 0 : NPIECE) + q);
         f(F_LEN + (c == p ? 0 : LEN_CAP + 1) + P.len[c]);
-#if NN_UB
         f(F_UB + (c == p ? 0 : UB_CAP + 1) + P.ub[c]);
-#endif
     }
     for (BB b = P.iso; b; b &= b - 1) f(F_ISO + CM.cellOf[lsb(b)]);
 }
@@ -193,14 +179,12 @@ inline void deltaOf(const Planes& P, const Planes& Q, Delta& d) {
                 push(p, base + P.len[c], false);
                 push(p, base + Q.len[c], true);
             }
-#if NN_UB
         if (P.ub[c] != Q.ub[c])
             for (int p = 0; p < 2; p++) {
                 int base = F_UB + (c == p ? 0 : UB_CAP + 1);
                 push(p, base + P.ub[c], false);
                 push(p, base + Q.ub[c], true);
             }
-#endif
     }
 }
 
