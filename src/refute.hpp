@@ -9,6 +9,8 @@
 // stop at the first move that survives, so a strong move is proved without refuting every weaker one.
 // Attacker moves are taken in the evaluation's order after the 8 best of a REFUTE_SEARCH (2) second
 // engine search; moves in `first` (answers that survived in sibling positions) are settled before all.
+// Every solve of the sweep, in both passes and all threads, uses one transposition table
+// (makeSweepTable, SOLVER_SWEEP_TT): the units are siblings and share much of their trees.
 // Log lines (resumable; every refutation is one position anyone can re-solve):
 // "<move> refuted <reply> [<nodes> <sec>]", "<move> open", "<move> wins" / "<move> holds". The first line is
 // `header` (the position, the question and the bonus); a log that starts otherwise is not resumed, so a
@@ -100,13 +102,14 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
     std::string survivor;
     for (auto& [m, st] : status) if (st == survives) survivor = m;
     std::mutex mu;
+    std::shared_ptr<LTT> table = makeSweepTable();
     // pass 1 on todo[from, to): a few node-budgeted tries per move, moves spread over threads
     auto quickPass = [&](size_t from, size_t to) {
         std::atomic<size_t> next{from};
         std::vector<std::thread> th;
         for (int w = 0; w < threads; w++)
             th.emplace_back([&] {
-                Solver S(22);
+                Solver S(table);
                 for (;;) {
                     size_t k = next++;
                     if (k >= to) break;
@@ -132,7 +135,7 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
                     bool refuted = false;
                     for (int t = 0; t < maxTries && t < (int)order.size() && !refuted; t++) {
                         Pos u = a; u.play(order[t].second);
-                        S.clear();
+                        S.newPosition();
                         auto ts = std::chrono::steady_clock::now();
                         // does the attacker win (avoid losing, with REFUTE_LOSS) after this reply?
                         int v = mustLose ? S.solve(u, 0, budget, -1, 0) : S.solve(u, 0, budget, 0, 1);
@@ -163,7 +166,7 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
             if (it == status.end() || it->second != "open") continue;
             Pos a = s; a.play(m);
             // does the defender lose (or, with REFUTE_LOSS, fail to win)?
-            auto r = parallelSolve(a, 1e9, threads, 22, {}, nullptr, mustLose ? WIN_TEST : LOSS_TEST);
+            auto r = parallelSolve(a, 1e9, threads, 22, {}, nullptr, mustLose ? WIN_TEST : LOSS_TEST, table);
             int refuting = mustLose ? 1 : 0;  // a defender reply this good refutes the move
             if (r.value != -9 && r.value < refuting) {
                 status[ms] = survives;
@@ -177,7 +180,7 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
                     break;
                 }
             fflush(log);
-            printf("pass 2: %s %s\n", ms.c_str(), status[ms].c_str());
+            printf("pass 2: %s %s (%llu nodes, %.1f s)\n", ms.c_str(), status[ms].c_str(), (unsigned long long)r.nodes, r.seconds);
             fflush(stdout);
         }
     };

@@ -17,6 +17,9 @@
 // Lockless 2-way transposition table. Each slot stores key^data and data, so an entry
 // torn by concurrent writes fails the key check instead of returning garbage.
 // Slot 0 of a bucket keeps the entry with the most work behind it, slot 1 is always replaced.
+// The key bits that pick the bucket verify nothing, so an entry also carries the position's 32-bit
+// keyCheck(): without it a 2^25-entry table would take a different position for the probed one about
+// once in 2^40 probes, which a proof running 10^12 nodes cannot afford.
 struct LTT {
     struct Slot { std::atomic<uint64_t> k{0}, d{0}; };
     std::unique_ptr<Slot[]> s;
@@ -26,31 +29,40 @@ struct LTT {
     void clear() {
         for (size_t i = 0; i < 2 * nb; i++) { s[i].k.store(0, std::memory_order_relaxed); s[i].d.store(0, std::memory_order_relaxed); }
     }
-    static uint64_t pack(int lo, int hi, int best, int work) {
-        return uint64_t(lo + 2) | uint64_t(hi + 2) << 3 | uint64_t(best + 1) << 6 | uint64_t(work) << 22;
+    // data: bits 0-2 lo + 2, 3-5 hi + 2, 6-21 best + 1, 22-27 work, 32-63 the key check
+    static uint64_t pack(int lo, int hi, int best, int work, uint32_t check) {
+        return uint64_t(lo + 2) | uint64_t(hi + 2) << 3 | uint64_t(best + 1) << 6 | uint64_t(work) << 22 | uint64_t(check) << 32;
     }
-    bool probe(uint64_t key, int& lo, int& hi, int& best) const {
+    static bool holds(uint64_t k, uint64_t d, uint64_t key, uint32_t check) { return (k ^ d) == key && uint32_t(d >> 32) == check; }
+    bool probe(uint64_t key, uint32_t check, int& lo, int& hi, int& best) const {
         size_t b = (key & mask) * 2;
         for (int i = 0; i < 2; i++) {
             uint64_t k = s[b + i].k.load(std::memory_order_relaxed), d = s[b + i].d.load(std::memory_order_relaxed);
-            if (d && (k ^ d) == key) {
+            if (d && holds(k, d, key, check)) {
                 lo = int(d & 7) - 2; hi = int(d >> 3 & 7) - 2; best = int(d >> 6 & 0xFFFF) - 1;
                 return true;
             }
         }
         return false;
     }
-    void store(uint64_t key, int lo, int hi, int best, int work) {
+    void store(uint64_t key, uint32_t check, int lo, int hi, int best, int work) {
         size_t b = (key & mask) * 2;
-        uint64_t d = pack(lo, hi, best, work);
+        uint64_t d = pack(lo, hi, best, work, check);
         uint64_t k0 = s[b].k.load(std::memory_order_relaxed), d0 = s[b].d.load(std::memory_order_relaxed);
-        int i = ((k0 ^ d0) == key || work >= int(d0 >> 22 & 63)) ? 0 : 1;
+        int i = (holds(k0, d0, key, check) || work >= int(d0 >> 22 & 63)) ? 0 : 1;
         s[b + i].d.store(d, std::memory_order_relaxed);
         s[b + i].k.store(key ^ d, std::memory_order_relaxed);
     }
 };
 
 inline int envInt(const char* name, int def) { const char* v = getenv(name); return v ? atoi(v) : def; }
+
+// The table of a run over many positions (a refutation sweep, a distributed worker): one table for the
+// whole run, shared by its threads, so that sibling positions reuse each other's subtrees (about 20% fewer
+// nodes over a whole line, more as the run goes on). SOLVER_SWEEP_TT=<log2 entries> of 16 bytes: the
+// default 2^25 entries is 512 MB, so 6-8 such processes fit side by side in 64 GB.
+constexpr int SWEEP_TT_LOG2 = 25;
+inline std::shared_ptr<LTT> makeSweepTable() { return std::make_shared<LTT>(envInt("SOLVER_SWEEP_TT", SWEEP_TT_LOG2) - 1); }
 // SOLVER_RED_BONUS=b counts b extra cells for red at the end of the game (default 0 = the real rules).
 // With it, "blue still wins" means blue wins by more than b: used to find the exact margin of a line.
 inline const int RED_BONUS = envInt("SOLVER_RED_BONUS", 0);
@@ -106,10 +118,17 @@ struct Solver {
         for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); legalBuf[i].resize(3000); scBuf[i].resize(3000); sortBuf[i].resize(3000); }
         std::memset(killer, -1, sizeof killer);
     }
-    void clear() {
-        tt->clear();
+    // Forgets what belongs to the last position solved and keeps the table: before each position of a
+    // run. Killer moves carried over from another position are tried first and cost 13-28% more nodes;
+    // the one-player memo's answers depend on the order of its queries, so a fresh one keeps the node
+    // counts of a position independent of the positions before it (on its own table).
+    void newPosition() {
         onePlayer.clear();
         std::memset(killer, -1, sizeof killer);
+    }
+    void clear() {
+        tt->clear();
+        newPosition();
     }
 
     static int terminalValue(const Pos& s) {
@@ -406,9 +425,10 @@ struct Solver {
         int lo = -1, hi = 1;
         int t;
         uint64_t k = s.key(t);
+        uint32_t check = s.keyCheck();
         int ttMove = -1, eLo, eHi, eBest = -1;
         bool hit;
-        TIMED(PART_TT, hit = tt->probe(k, eLo, eHi, eBest));
+        TIMED(PART_TT, hit = tt->probe(k, check, eLo, eHi, eBest));
         if (hit) {
             lo = eLo; hi = eHi;
             if (lo >= hi || lo >= beta) { pTT[pp]++; return lo; }
@@ -420,7 +440,7 @@ struct Solver {
             TIMED(PART_LAST, v = lastPieces(s));
             if (v != -2) {
                 pLast[pp]++;
-                tt->store(k, v, v, eBest, 0);
+                tt->store(k, check, v, v, eBest, 0);
                 return v;
             }
         }
@@ -453,7 +473,7 @@ struct Solver {
                                      tightenBounds(s, legal, nLegal, lo, hi, alpha, beta, lbMe, ubMe, lbOp, ubOp, bonus, myClusters, oppClusters));
             if (lo >= hi || lo >= beta || hi <= alpha) {
                 pTight[pp]++;
-                tt->store(k, lo, hi, eBest, 0);
+                tt->store(k, check, lo, hi, eBest, 0);
                 return lo >= hi || lo >= beta ? lo : hi;
             }
         }
@@ -526,9 +546,9 @@ struct Solver {
                     // enhanced transposition cutoff: a child already known to be good enough
                     int cv = -9;
                     if (c.over()) cv = -terminalValue(c);
-                    else { int ct, clo, chi, cb; if (tt->probe(c.key(ct), clo, chi, cb)) cv = -chi; }  // our value >= -chi
+                    else { int ct, clo, chi, cb; if (tt->probe(c.key(ct), c.keyCheck(), clo, chi, cb)) cv = -chi; }  // our value >= -chi
                     if (cv >= beta) {
-                        tt->store(k, std::max(lo, cv), hi, T.gidSym[moves[i].gid][t], 0);
+                        tt->store(k, check, std::max(lo, cv), hi, T.gidSym[moves[i].gid][t], 0);
                         return cv;
                     }
                 }
@@ -601,7 +621,7 @@ struct Solver {
         else nlo = nhi = best;
         uint64_t work = nodes - n0 + 1;
         int w = 63 - __builtin_clzll(work);
-        tt->store(k, nlo, nhi, bestGid >= 0 ? T.gidSym[bestGid][t] : eBest, w);
+        tt->store(k, check, nlo, nhi, bestGid >= 0 ? T.gidSym[bestGid][t] : eBest, w);
         return best;
     }
 
@@ -642,10 +662,12 @@ struct ParallelSolveResult {
 };
 // known: root moves whose value is already known (e.g. from an interrupted run) - skipped.
 // onResult: called (under a lock) for every newly solved root move.
+// table: one table for all threads (a sweep's, kept across calls); without it SOLVER_SHARED=<log2 entries>
+// gives the threads one table, otherwise each thread has its own of 2^ttLog2 entries.
 inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int threads, int ttLog2 = 22,
                                          const std::vector<std::pair<Move, int>>& known = {},
                                          std::function<void(Move, int, uint64_t, double)> onResult = nullptr,
-                                         SolveQuestion question = EXACT) {
+                                         SolveQuestion question = EXACT, std::shared_ptr<LTT> table = nullptr) {
     auto t0 = std::chrono::steady_clock::now();
     ParallelSolveResult res;
     std::vector<Move> all, mv;
@@ -676,9 +698,8 @@ inline ParallelSolveResult parallelSolve(const Pos& root, double seconds, int th
     std::mutex mu;
     threads = std::max(1, std::min<int>(threads, (int)mv.size()));
     std::vector<std::thread> th;
-    // SOLVER_SHARED=<log2 entries>: one transposition table shared by all threads
     int sharedLog2 = envInt("SOLVER_SHARED", 0);
-    std::shared_ptr<LTT> shared = sharedLog2 ? std::make_shared<LTT>(sharedLog2 - 1) : nullptr;
+    std::shared_ptr<LTT> shared = table ? table : sharedLog2 ? std::make_shared<LTT>(sharedLog2 - 1) : nullptr;
     auto work = [&] {
         std::unique_ptr<Solver> SP(shared ? new Solver(shared) : new Solver(ttLog2));
         Solver& S = *SP;

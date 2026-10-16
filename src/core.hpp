@@ -371,6 +371,16 @@ struct Pos {
         for (int u = 1; u < NSYM; u++) if (h[u] < h[t]) t = u;
         return h[t];
     }
+    // 32 more bits that tell positions with the same key apart (the transposition table stores them),
+    // from the cells and pieces, independently of the Zobrist key. Near the root, where the key is
+    // symmetry-canonical, it is 0 (those few positions do not need it).
+    uint32_t keyCheck() const {
+        if (ply <= SYM_PLY) return 0;
+        uint64_t x = (uint64_t)own[0] * 0x9E3779B97F4A7C15ULL ^ (uint64_t)(own[0] >> 64) * 0xC2B2AE3D27D4EB4FULL ^
+                     (uint64_t)own[1] * 0x165667B19E3779F9ULL ^ (uint64_t)(own[1] >> 64) * 0x27D4EB2F165667C5ULL ^
+                     uint64_t(avail[0] | avail[1] << 8 | stm << 16) * 0x85EBCA77C2B2AE63ULL;
+        return uint32_t(x >> 32);
+    }
 
     // Straightforward per-placement legality check (reference for the fast generator).
     bool legal(const Placement& pl) const { return legalFor(stm, pl); }

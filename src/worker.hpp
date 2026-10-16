@@ -11,6 +11,8 @@
 // With SOLVER_WIN_TEST=1 the worker only asks whether the side to move wins (cheaper): a unit
 // that is not a win comes back as 0 (draw or loss) or -1 (proven loss) instead of its exact value.
 // A worker that loses the connection reconnects; the coordinator re-queues its units.
+// The threads share one transposition table, kept from unit to unit (makeSweepTable); the rest of a
+// solver's state is reset for every unit (Solver::newPosition).
 #pragma once
 #include <condition_variable>
 #include <deque>
@@ -101,9 +103,10 @@ inline int runWorker(const std::string& hostport, int threads, const std::string
     auto t0 = std::chrono::steady_clock::now();
 
     std::vector<std::thread> th;
+    std::shared_ptr<LTT> table = makeSweepTable();  // the units are usually siblings
     for (int w = 0; w < threads; w++)
         th.emplace_back([&] {
-            Solver S(22);
+            Solver S(table);
             bool winTest = envInt("SOLVER_WIN_TEST", 0) != 0;
             for (;;) {
                 std::pair<std::string, std::string> u;
@@ -131,6 +134,7 @@ inline int runWorker(const std::string& hostport, int threads, const std::string
                 if (!ok) {
                     snprintf(line, sizeof line, "result %s bad 0 0", u.first.c_str());
                 } else {
+                    S.newPosition();
                     auto ts = std::chrono::steady_clock::now();
                     int v = S.solve(s, 0, limit ? limit : UINT64_MAX, winTest ? 0 : -1, 1);  // -9 = budget exceeded
                     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();

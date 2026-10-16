@@ -465,7 +465,7 @@ inline double proofProgress(const Pos& root, Move m, const LTT& tt) {
         Pos g = c; g.play(x);
         int t, lo, hi, best;
         total++;
-        if (g.over() ? Solver::terminalValue(g) > 0 : tt.probe(g.key(t), lo, hi, best) && lo >= 1) proven++;
+        if (g.over() ? Solver::terminalValue(g) > 0 : tt.probe(g.key(t), g.keyCheck(), lo, hi, best) && lo >= 1) proven++;
     });
     return total ? (double)proven / total : 0;
 }
