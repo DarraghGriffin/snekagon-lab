@@ -79,6 +79,38 @@ static void snakeBoundsRef(const Pos& s, int c, int& lb, int& ub) {
     }
 }
 
+// The one-player optimum of player c (the longest snake OnePlayer allows), searched in the given
+// clusters, or -1 if a decision ran out of budget.
+static int onePlayerOptimum(OnePlayer& op, const Pos& s, int c, const Clusters& cl, int ub) {
+    for (int t = ub; t > s.L[c]; t--) {
+        uint64_t unknown = op.outOfBudget;
+        bool may = op.mayReach(s, c, cl, t);
+        if (op.outOfBudget != unknown) return -1;
+        if (may) return t;
+    }
+    return s.L[c];
+}
+// Longest final snake of player c under the real rules if the opponent never moved again (it passes),
+// by brute force; -1 when `budget` positions are used up.
+static int oneHandedBest(const Pos& s, int c, uint64_t& budget) {
+    if (budget == 0) return -1;
+    budget--;
+    int best = s.L[c];
+    Pos a = s;
+    a.stm = (uint8_t)c;
+    if (!a.avail[c]) return best;
+    std::vector<Move> mv;
+    a.genMoves(mv);
+    for (Move m : mv) {
+        Pos b = a;
+        b.play(m);
+        int v = oneHandedBest(b, c, budget);
+        if (v < 0) return -1;
+        best = std::max(best, v);
+    }
+    return best;
+}
+
 // ---- training data rows ----------------------------------------------------------
 static std::string hex128(BB b) {
     char buf[40];
@@ -172,6 +204,13 @@ int main(int argc, char** argv) {
         int games = argc > 2 ? std::atoi(argv[2]) : 2000;
         Rng rng(99);
         long positions = 0, boundChecks = 0;
+        // one-player optimum (positions where the player has at most VERIFY_OPTIMUM_PIECES pieces):
+        // final snake <= optimum <= cheap bound, per cluster == on the whole board, and >= the
+        // real-rules one-player brute force (at most 3 pieces)
+        constexpr int VERIFY_OPTIMUM_PIECES = 4, VERIFY_BRUTE_PIECES = 3;
+        constexpr uint64_t BRUTE_BUDGET = 300000;
+        OnePlayer op;
+        long optChecks = 0, optTighter = 0, optUnknown = 0, bruteCompared = 0, bruteEqual = 0, bruteUnknown = 0;
         std::vector<Move> fast, slow;
         for (int g = 0; g < games; g++) {
             Pos s = Pos::start();
@@ -221,9 +260,37 @@ int main(int argc, char** argv) {
                         printf("BOUND VIOLATION game %d ply %d player %d: final %d, bounds [%d,%d]\n", g, (int)h.ply, c, fin[c], lb, ub);
                         return 1;
                     }
+                    if (h.ply == 0 || pieceCount(h.avail[c]) > VERIFY_OPTIMUM_PIECES) continue;
+                    Clusters cl, whole;
+                    snakeClusters(h, c, lb, ub, cl);
+                    whole.n = 1;  // one region over the whole board: the clusters must not change the answer
+                    whole.cells[0] = h.own[c] | growable(h, c);
+                    whole.ub[0] = NIDX;
+                    int opt = onePlayerOptimum(op, h, c, cl, ub), optWhole = onePlayerOptimum(op, h, c, whole, NIDX);
+                    if (opt < 0 || optWhole < 0) { optUnknown++; continue; }
+                    optChecks++;
+                    optTighter += opt < ub;
+                    if (fin[c] > opt || opt != optWhole) {
+                        printf("ONE-PLAYER VIOLATION game %d ply %d player %d: final %d, optimum %d (whole board %d), cheap bound %d\n", g,
+                               (int)h.ply, c, fin[c], opt, optWhole, ub);
+                        return 1;
+                    }
+                    if (pieceCount(h.avail[c]) > VERIFY_BRUTE_PIECES) continue;
+                    uint64_t budget = BRUTE_BUDGET;
+                    int real = oneHandedBest(h, c, budget);
+                    if (real < 0) { bruteUnknown++; continue; }
+                    bruteCompared++;
+                    bruteEqual += real == opt;
+                    if (real > opt) {
+                        printf("ONE-PLAYER VIOLATION game %d ply %d player %d: real-rules optimum %d > relaxation %d\n", g, (int)h.ply, c, real, opt);
+                        return 1;
+                    }
                 }
         }
         printf("ok: %ld positions movegen identical, %ld bound checks hold\n", positions, boundChecks);
+        printf("ok: one-player optimum in %ld checks (%ld unknown): final <= optimum <= cheap bound (strictly below it in %ld), "
+               "per cluster == whole board; >= real-rules brute force in %ld (equal %ld, %ld over budget)\n",
+               optChecks, optUnknown, optTighter, bruteCompared, bruteEqual, bruteUnknown);
     } else if (mode == "gendata") {
         // snek gendata <games> <plyMin> <plyMax> <solveSecs> <threads> <seed>
         // Plays softmax-greedy games (1-ply eval, some random moves), solves the
