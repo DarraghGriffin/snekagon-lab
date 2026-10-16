@@ -153,7 +153,7 @@ The one-player optimum and the guaranteed growth bounds were ported later. For t
 `BENCH_FRESH=1 BENCH_WINTEST=1 benchset` on the four `bench/ply5_*` sets (also with `BENCH_PNS=1` on
 `ply5_blue_wins.txt` and `ply5_other_openings.txt`) and `solvebench` 9 96 (red bonus -1, 0, +1) and
 6 12 (1 thread) were compared again: identical. With them, `BENCH_WINTEST=1` on `ply5_blue_wins.txt`
-takes 3 811 277 nodes, and `BENCH_PNS=1` 3 105 446.
+takes 3 846 827 nodes, and `BENCH_PNS=1` 3 132 602.
 
 With several threads the order of the work depends on timing, so those runs were compared by their
 results: `solvepos` with 4 threads (exact, and `SOLVER_WIN_TEST=1` at ply 5), `refute 2` (the same

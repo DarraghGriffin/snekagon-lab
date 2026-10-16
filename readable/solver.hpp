@@ -322,10 +322,13 @@ class Solver {
     int evalOrderIfHopefulFromPieces = envInt("SOLVER_EVAL_WIN_REM", 7);
     double hopefulLogit = envInt("SOLVER_EVAL_WIN_THR", -100) / 100.0;
     int etcFromPieces = envInt("SOLVER_ETC_REM", 99);  // enhanced transposition cutoffs (off by default)
-    // The tight bounds (the one-player optimum and guaranteed growth) once at most this many pieces
-    // are left in total: higher up, a question costs more than it saves.
-    static constexpr int TIGHT_BOUNDS_MAX_PIECES = 5;
+    // The tight bounds (the one-player optimum and guaranteed growth) cost more than they save
+    // higher up: they are used at every node once at most TIGHT_BOUNDS_MAX_PIECES pieces are left in
+    // total, and with up to ALL_NODE_TIGHT_BOUNDS_MAX_PIECES only once a node's first move failed,
+    // where every remaining move would have to be searched.
+    static constexpr int TIGHT_BOUNDS_MAX_PIECES = 5, ALL_NODE_TIGHT_BOUNDS_MAX_PIECES = 6;
     int tightBoundsUpToPieces = envInt("SOLVER_TIGHT_REM", TIGHT_BOUNDS_MAX_PIECES);
+    int allNodeTightBoundsUpToPieces = envInt("SOLVER_TIGHT_ALL_REM", ALL_NODE_TIGHT_BOUNDS_MAX_PIECES);
 
     uint64_t nodes = 0;                        // nodes searched since solve() (or since set to 0)
     std::atomic<bool>* stopFlag = nullptr;     // set from outside to abort the search
@@ -602,6 +605,7 @@ class Solver {
 
         // 6. Search the moves, best-scored first.
         bool scanned = !threatsOn || !scanForThreats;
+        bool allNodeChecked = tight || piecesLeft > allNodeTightBoundsUpToPieces;
         int best = -2, bestMove = -1;
         if (count == 0 && skipped == -2) {
             Position child = pos;
@@ -627,6 +631,28 @@ class Solver {
                 if (alpha >= beta) {
                     rememberKiller(ply, moves[i]);
                     break;
+                }
+                // The first move failed: above the tight bounds' gate, the tight bounds over the
+                // moves left may settle them all at once.
+                if (!allNodeChecked && i + 2 < count) {
+                    allNodeChecked = true;
+                    int restLower = -1, restUpper = 1;
+                    timed(STEP_TIGHT_BOUNDS, profilePly, [&] {
+                        if (!useThreats) snakeBounds(pos, pos.sideToMove, &myClusters);
+                        snakeBounds(pos, pos.sideToMove ^ 1, &oppClusters);
+                        narrowByTightBounds(pos, moves + i + 1, count - i - 1, restLower, restUpper, alpha, beta, mine, theirs, myClusters,
+                                            oppClusters);
+                    });
+                    if (restUpper <= alpha) {  // no move left can raise alpha
+                        profile.tightCut[profilePly]++;
+                        best = std::max(best, restUpper);
+                        break;
+                    }
+                    if (restLower >= beta) {  // one of them reaches beta
+                        profile.tightCut[profilePly]++;
+                        best = restLower;
+                        break;
+                    }
                 }
                 // The refutation just found may be a threat against the remaining moves. And once
                 // the first move failed, this is probably a node where every move must be refuted,
@@ -676,7 +702,8 @@ class Solver {
 
     // The tight bounds: guaranteed growth raises the sure lengths, then the one-player optimum is
     // asked only the questions whose answer would end the node in the window (alpha, beta).
-    // `me` includes our share of the red bonus; `legal`: every legal move of ours.
+    // `me` includes our share of the red bonus. `legal`: every legal move of ours, or only some of
+    // them: then [lower, upper] bounds the best of those (the growth bounds hold move by move).
     void narrowByTightBounds(const Position& pos, const Move* legal, int legalCount, int& lower, int& upper, int alpha, int beta,
                              SnakeBounds me, SnakeBounds opp, const SnakeClusters& myClusters, const SnakeClusters& oppClusters) {
         int mover = pos.sideToMove, other = mover ^ 1;
