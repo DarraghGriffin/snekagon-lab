@@ -364,7 +364,7 @@ approximate), before and after:
 
 | | before | after |
 |---|---|---|
-| the whole `hold_4C26_4A58` line, `REFUTE_SEARCH=0 snek refute 3` from an empty log | 395.4 M nodes in the refutations, 1030 unit-s, 436 s wall | 314.4 M (−20.5 %), 824 unit-s, 363 s wall |
+| the whole `hold_4C26_4A58` line, `REFUTE_SEARCH=0 snek refute 3` from an empty log | 395.4 M nodes in the refutations, 1030 unit-s, 436 s wall | 314.4 M (−20.5 %), 776 unit-s, 341 s wall (1.28x); a 2^26-entry table: 311.1 M, 342 s |
 | its first 200 units | 61.3 M nodes, 73 s wall | 59.9 M, 71 s |
 | the same 200 units as `SOLVER_WIN_TEST=1 snek worker` units (2 threads, a local test coordinator) | 67.0 M nodes, 86 s wall | 60.0 M, 73 s; the same 200 answers |
 | a blue's-half step (red `4A:55,56,67,78`, blue's `4C:92,103,112,113` holds; `REFUTE_LOSS=1 REFUTE_FIRST`, 1 thread, 6 runs each, back to back) | 48.7 s | 42.2 s (1.15x); the proof takes 15.23 M nodes, 16.40 M with killers kept across root moves |
