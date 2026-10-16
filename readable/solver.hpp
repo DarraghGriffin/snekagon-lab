@@ -7,6 +7,8 @@
 //     length beats the other's best possible length;
 //   - the last pieces: once each player has at most one piece left, the value follows from the
 //     placements without a search;
+//   - tight bounds near the end: the exact one-player optimum (bounds.hpp) and the lengths both
+//     players are sure to reach one and two plies ahead;
 //   - threat zones: an opponent placement that would decide the game if the opponent could play
 //     it right now has to be answered, so only our moves through its zone are searched;
 //   - move ordering: table move, killer moves, simple shape heuristics and, while many pieces are
@@ -103,6 +105,55 @@ inline bool lastPiecesValue(const Position& pos, int& value) {
     return true;
 }
 
+// ---- guaranteed growth -----------------------------------------------------------------------
+
+// Lower bounds on both final snakes, one and two plies ahead. `legal`: every legal move of the
+// side to move.
+//  - The side to move reaches at least the longest snake of its best move now (myLength).
+//  - The opponent reaches at least the length that none of our moves prevents (oppLength): some
+//    placement of its that reaches it stays legal after any single move of ours (a grow placement
+//    unless we cover it, a new snake unless we cover or touch it). Our move only takes opponent
+//    placements away, never adds any; if we have to pass, every one stays.
+inline void guaranteedGrowth(const Position& pos, const Move* legal, int legalCount, int& myLength, int& oppLength) {
+    int me = pos.sideToMove, opp = me ^ 1;
+    myLength = pos.longestSnake[me];
+    for (int i = 0; i < legalCount; i++) myLength = std::max(myLength, longestSnakeAfter(pos, me, legal[i].placement()));
+    oppLength = pos.longestSnake[opp];
+    if (!pos.piecesLeft[opp]) return;
+
+    // the opponent's placements that would lengthen its longest snake
+    struct Extension {
+        Bitboard blockedBy;  // any of our cells here makes it illegal
+        int length;
+    };
+    constexpr int MAX_EXTENSIONS = 512;
+    Extension extensions[MAX_EXTENSIONS];
+    int count = 0;
+    Position asOpponent = pos;
+    asOpponent.sideToMove = opp;
+    Bitboard occupied = pos.occupied();
+    auto add = [&](Move m) {
+        const Placement& p = m.placement();
+        int length = longestSnakeAfter(pos, opp, p);
+        if (length > pos.longestSnake[opp] && count < MAX_EXTENSIONS)
+            extensions[count++] = Extension{p.border & occupied ? p.cells : p.cells | p.border, length};
+    };
+    // a new snake is longer only while the opponent's snakes are shorter than a piece
+    if (pos.longestSnake[opp] >= PIECE_SIZE[PIECE_4C]) forEachGrowingMove(asOpponent, add);
+    else forEachLegalMove(asOpponent, add);
+    if (!count) return;
+    std::sort(extensions, extensions + count, [](const Extension& a, const Extension& b) { return a.length > b.length; });
+
+    oppLength = extensions[0].length;  // if we have to pass, every placement stays
+    for (int i = 0; i < legalCount && oppLength > pos.longestSnake[opp]; i++) {
+        Bitboard ours = legal[i].placement().cells;
+        int best = pos.longestSnake[opp];  // the opponent's longest extension that our move leaves
+        for (int j = 0; j < count && extensions[j].length > best; j++)
+            if (!(extensions[j].blockedBy & ours)) { best = extensions[j].length; break; }
+        oppLength = std::min(oppLength, best);
+    }
+}
+
 // ---- threats ---------------------------------------------------------------------------------
 //
 // An opponent placement b is a threat when, if the opponent could play b right now as a free move,
@@ -135,14 +186,17 @@ class ThreatList {
     }
 
     // Adds the opponent placement `placementId` (-1: none) if it is a threat. Each placement is
-    // looked at only once per node.
-    void tryPlacement(const Position& pos, int placementId) {
+    // looked at only once per node. With `optimum`, our bound after the placement is the
+    // one-player optimum, which is sound in the same way: whatever we play that leaves b playable,
+    // every continuation is one that the relaxation after b allows.
+    void tryPlacement(const Position& pos, int placementId, OnePlayerOptimum* optimum = nullptr) {
         if (placementId < 0 || count >= MAX_THREATS || triedCount >= MAX_TRIED) return;
         for (int i = 0; i < triedCount; i++)
             if (tried[i] == placementId) return;
         tried[triedCount++] = placementId;
         const Placement& b = pieceTables.placements[placementId];
         int value = threatValue(pos, b);
+        if (optimum && (value == 0 || value == 1)) value = optimumThreatValue(pos, b, value, *optimum);
         if (value <= 0) threats[count++] = Threat{threatZone(pos, b), value};
     }
 
@@ -223,6 +277,20 @@ class ThreatList {
         return growsSnake ? b.cells : b.cells | b.border;
     }
 
+    // threatValue() (0 or 1 there) with our one-player optimum after b instead of the bounds.
+    static int optimumThreatValue(const Position& pos, const Placement& b, int value, OnePlayerOptimum& optimum) {
+        int me = pos.sideToMove, opp = me ^ 1;
+        int bonus = redBonusFor(me);
+        Position after = pos;
+        after.cells[opp] |= b.cells;
+        SnakeClusters ours;
+        snakeBounds(after, me, &ours);
+        int oppLength = longestSnakeAfter(pos, opp, b);
+        if (value == 1 && !optimum.mayReach(after, me, ours, oppLength - bonus + 1)) value = 0;
+        if (value == 0 && !optimum.mayReach(after, me, ours, oppLength - bonus)) value = -1;
+        return value;
+    }
+
     // What the bounds tell about our value if the opponent played b now: -1 (a loss), 0 (at most
     // a draw) or 1 (nothing); NOT_PLAYABLE when the opponent cannot play b.
     static int threatValue(const Position& pos, const Placement& b) {
@@ -254,18 +322,23 @@ class Solver {
     int evalOrderIfHopefulFromPieces = envInt("SOLVER_EVAL_WIN_REM", 7);
     double hopefulLogit = envInt("SOLVER_EVAL_WIN_THR", -100) / 100.0;
     int etcFromPieces = envInt("SOLVER_ETC_REM", 99);  // enhanced transposition cutoffs (off by default)
+    // The tight bounds (the one-player optimum and guaranteed growth) once at most this many pieces
+    // are left in total: higher up, a question costs more than it saves.
+    static constexpr int TIGHT_BOUNDS_MAX_PIECES = 5;
+    int tightBoundsUpToPieces = envInt("SOLVER_TIGHT_REM", TIGHT_BOUNDS_MAX_PIECES);
 
     uint64_t nodes = 0;                        // nodes searched since solve() (or since set to 0)
     std::atomic<bool>* stopFlag = nullptr;     // set from outside to abort the search
 
     // The steps of a node, for the timing profile of a build with -DSOLVER_TIMING.
-    enum Step { STEP_TABLE, STEP_LAST_PIECES, STEP_BOUNDS, STEP_KILLER_THREATS, STEP_MOVE_GENERATION, STEP_THREAT_SCAN,
-                STEP_CHILD_POSITION, NUM_STEPS };
-    static constexpr const char* STEP_NAMES[NUM_STEPS] = {"tt", "lastPieces", "bounds", "killerThreats", "movegen", "scan", "childMake"};
+    enum Step { STEP_TABLE, STEP_LAST_PIECES, STEP_BOUNDS, STEP_TIGHT_BOUNDS, STEP_KILLER_THREATS, STEP_MOVE_GENERATION,
+                STEP_THREAT_SCAN, STEP_CHILD_POSITION, NUM_STEPS };
+    static constexpr const char* STEP_NAMES[NUM_STEPS] = {"tt", "lastPieces", "bounds", "tightBounds", "killerThreats",
+                                                          "movegen", "scan", "childMake"};
 
     // Per-ply statistics (benchset with PROFILE=1).
     struct Profile {
-        uint64_t visited[16] = {}, tableCut[16] = {}, lastPieces[16] = {}, boundCut[16] = {}, expanded[16] = {};
+        uint64_t visited[16] = {}, tableCut[16] = {}, lastPieces[16] = {}, boundCut[16] = {}, tightCut[16] = {}, expanded[16] = {};
         uint64_t movesListed[16] = {}, threatSkipped[16] = {};  // moves listed for the search / skipped by threat zones
         uint64_t threatScans[16] = {}, threatScansFound[16] = {};  // threat scans / scans that found a new threat
 #ifdef SOLVER_TIMING
@@ -278,6 +351,7 @@ class Solver {
                 tableCut[ply] += other.tableCut[ply];
                 lastPieces[ply] += other.lastPieces[ply];
                 boundCut[ply] += other.boundCut[ply];
+                tightCut[ply] += other.tightCut[ply];
                 expanded[ply] += other.expanded[ply];
                 movesListed[ply] += other.movesListed[ply];
                 threatSkipped[ply] += other.threatSkipped[ply];
@@ -295,11 +369,15 @@ class Solver {
     explicit Solver(int log2Entries = 22) : table(std::make_shared<TranspositionTable>(log2Entries - 1)) { init(); }
     explicit Solver(std::shared_ptr<TranspositionTable> shared) : table(std::move(shared)) { init(); }
 
-    // Forget everything learned (table, killers).
+    // Forget everything learned (table, killers, one-player answers).
     void clear() {
         table->clear();
+        onePlayer.clear();
         std::memset(killers, -1, sizeof killers);
     }
+
+    const OnePlayerOptimum::Statistics& onePlayerStatistics() const { return onePlayer.stats; }
+    void resetOnePlayerStatistics() { onePlayer.stats = OnePlayerOptimum::Statistics{}; }
 
     // Value for the side to move within the window (alpha, beta) - exact inside it, a bound
     // outside - or UNKNOWN when the limits stopped the search. seconds = 0: no time limit.
@@ -342,6 +420,8 @@ class Solver {
     std::shared_ptr<TranspositionTable> table;
     int16_t killers[MAX_PLY][2];            // per ply: the last two moves that caused a cutoff
     std::vector<Move> moveBuffer[MAX_PLY];  // per-ply move lists, allocated once
+    std::vector<Move> legalBuffer[MAX_PLY]; // per ply: every legal move, where the tight bounds list them
+    OnePlayerOptimum onePlayer;
     std::vector<int> scoreBuffer[MAX_PLY];
     std::vector<uint64_t> sortKeyBuffer[MAX_PLY];
 
@@ -353,6 +433,7 @@ class Solver {
     void init() {
         for (int i = 0; i < MAX_PLY; i++) {
             moveBuffer[i].resize(MAX_MOVES);
+            legalBuffer[i].resize(MAX_MOVES);
             scoreBuffer[i].resize(MAX_MOVES);
             sortKeyBuffer[i].resize(MAX_MOVES);
         }
@@ -445,10 +526,30 @@ class Solver {
         }
 
         // 3. The snake-length bounds.
-        SnakeClusters myClusters;  // kept for the threat scan
-        timed(STEP_BOUNDS, profilePly, [&] { narrowByBounds(pos, lower, upper, useThreats ? &myClusters : nullptr); });
+        int piecesLeft = pieceCount(pos.piecesLeft[RED]) + pieceCount(pos.piecesLeft[BLUE]);
+        bool tight = piecesLeft <= tightBoundsUpToPieces;
+        SnakeClusters myClusters, oppClusters;  // kept for the threat scan and the tight bounds
+        SnakeBounds mine, theirs;
+        timed(STEP_BOUNDS, profilePly, [&] {
+            narrowByBounds(pos, lower, upper, useThreats || tight ? &myClusters : nullptr, tight ? &oppClusters : nullptr, mine, theirs);
+        });
         if (lower >= upper || lower >= beta) { profile.boundCut[profilePly]++; return lower; }
         if (upper <= alpha) { profile.boundCut[profilePly]++; return upper; }
+
+        // 3b. Near the end, the tight bounds. They need every legal move of ours, which step 5 then reuses.
+        Move* legal = tight ? legalBuffer[pos.ply & 31].data() : nullptr;
+        int legalCount = 0;
+        if (tight) {
+            timed(STEP_TIGHT_BOUNDS, profilePly, [&] {
+                forEachLegalMove(pos, [&](Move m) { legal[legalCount++] = m; });
+                narrowByTightBounds(pos, legal, legalCount, lower, upper, alpha, beta, mine, theirs, myClusters, oppClusters);
+            });
+            if (lower >= upper || lower >= beta || upper <= alpha) {
+                profile.tightCut[profilePly]++;
+                table->store(key, lower, upper, stored.bestMove, 0);
+                return lower >= upper || lower >= beta ? lower : upper;
+            }
+        }
         profile.expanded[profilePly]++;
         alpha = std::max(alpha, lower);
         beta = std::min(beta, upper);
@@ -463,8 +564,8 @@ class Solver {
         ThreatList threats;
         if (threatsOn)
             timed(STEP_KILLER_THREATS, profilePly, [&] {
-                threats.tryPlacement(pos, killers[ply + 1][0]);
-                threats.tryPlacement(pos, killers[ply + 1][1]);
+                threats.tryPlacement(pos, killers[ply + 1][0], tight ? &onePlayer : nullptr);
+                threats.tryPlacement(pos, killers[ply + 1][1], tight ? &onePlayer : nullptr);
             });
         int skipped = -2;  // the best bound of the moves skipped because of threats
         auto skipByThreats = [&](Move m) {
@@ -480,8 +581,7 @@ class Solver {
         Move* moves = moveBuffer[pos.ply & 31].data();
         int* scores = scoreBuffer[pos.ply & 31].data();
         int count;
-        timed(STEP_MOVE_GENERATION, profilePly, [&] { count = scoreMoves(pos, tableMove, moves, scores, skipByThreats); });
-        int piecesLeft = pieceCount(pos.piecesLeft[RED]) + pieceCount(pos.piecesLeft[BLUE]);
+        timed(STEP_MOVE_GENERATION, profilePly, [&] { count = scoreMoves(pos, tableMove, legal, legalCount, moves, scores, skipByThreats); });
         bool orderByEval = count > 1 && (piecesLeft >= evalOrderFromPieces ||
                                          (piecesLeft >= evalOrderIfHopefulFromPieces && learnedLogit(pos) > hopefulLogit));
         bool tryEtc = count > 0 && piecesLeft >= etcFromPieces;
@@ -532,7 +632,7 @@ class Solver {
                 // the first move failed, this is probably a node where every move must be refuted,
                 // so look for all of the opponent's threats.
                 if (threatsOn && i + 2 < count) {
-                    threats.tryPlacement(pos, killers[ply + 1][0]);
+                    threats.tryPlacement(pos, killers[ply + 1][0], tight ? &onePlayer : nullptr);
                     if (!scanned) {
                         scanned = true;
                         int before = threats.size();
@@ -559,10 +659,12 @@ class Solver {
     }
 
     // Snake-length bounds: if my sure length beats the opponent's best possible one I have won,
-    // and so on. With `myClusters`, the side to move's clusters are kept there.
-    static void narrowByBounds(const Position& pos, int& lower, int& upper, SnakeClusters* myClusters) {
-        SnakeBounds me = snakeBounds(pos, pos.sideToMove, myClusters);
-        SnakeBounds opp = snakeBounds(pos, pos.sideToMove ^ 1);
+    // and so on. With `myClusters` / `oppClusters`, the players' clusters are kept there; `me`
+    // (with our share of the red bonus) and `opp` get the bounds.
+    static void narrowByBounds(const Position& pos, int& lower, int& upper, SnakeClusters* myClusters, SnakeClusters* oppClusters,
+                               SnakeBounds& me, SnakeBounds& opp) {
+        me = snakeBounds(pos, pos.sideToMove, myClusters);
+        opp = snakeBounds(pos, pos.sideToMove ^ 1, oppClusters);
         int bonus = redBonusFor(pos.sideToMove);
         me.lower += bonus;
         me.upper += bonus;
@@ -572,15 +674,43 @@ class Solver {
         upper = std::min(upper, boundUpper);
     }
 
-    // Generates the moves that `skip` lets through, with cheap ordering scores; returns their number.
+    // The tight bounds: guaranteed growth raises the sure lengths, then the one-player optimum is
+    // asked only the questions whose answer would end the node in the window (alpha, beta).
+    // `me` includes our share of the red bonus; `legal`: every legal move of ours.
+    void narrowByTightBounds(const Position& pos, const Move* legal, int legalCount, int& lower, int& upper, int alpha, int beta,
+                             SnakeBounds me, SnakeBounds opp, const SnakeClusters& myClusters, const SnakeClusters& oppClusters) {
+        int mover = pos.sideToMove, other = mover ^ 1;
+        int bonus = redBonusFor(mover);
+        int myLength, oppLength;
+        guaranteedGrowth(pos, legal, legalCount, myLength, oppLength);
+        me.lower = std::max(me.lower, myLength + bonus);
+        opp.lower = std::max(opp.lower, oppLength);
+        lower = std::max(lower, me.lower > opp.upper ? 1 : me.lower >= opp.upper ? 0 : -1);
+        upper = std::min(upper, me.upper < opp.lower ? -1 : me.upper <= opp.lower ? 0 : 1);
+        auto decided = [&] { return lower >= upper || lower >= beta || upper <= alpha; };
+        if (decided()) return;
+        // our optimum against the opponent's sure length lowers the upper bound: to 0 if we cannot
+        // pass it (a cutoff only when alpha >= 0 or lower >= 0), to -1 if we cannot reach it
+        if (upper == 1 && (alpha >= 0 || lower >= 0) && !onePlayer.mayReach(pos, mover, myClusters, opp.lower - bonus + 1)) upper = 0;
+        if (decided()) return;
+        if ((upper == 0 || alpha == -1) && !onePlayer.mayReach(pos, mover, myClusters, opp.lower - bonus)) upper = -1;
+        if (decided()) return;
+        // the opponent's optimum against our sure length raises the lower bound the same way
+        if (lower == -1 && (beta <= 0 || upper <= 0) && !onePlayer.mayReach(pos, other, oppClusters, me.lower + 1)) lower = 0;
+        if (decided()) return;
+        if ((lower == 0 || beta == 1) && !onePlayer.mayReach(pos, other, oppClusters, me.lower)) lower = 1;
+    }
+
+    // The moves that `skip` lets through, with cheap ordering scores; returns their number. From
+    // `legal` if the legal moves are listed there already, else generated.
     template <class Skip>
-    int scoreMoves(const Position& pos, int tableMove, Move* moves, int* scores, Skip&& skip) {
+    int scoreMoves(const Position& pos, int tableMove, const Move* legal, int legalCount, Move* moves, int* scores, Skip&& skip) {
         Bitboard own = pos.ownCells(), opp = pos.opponentCells();
         Bitboard opponentFront = neighboursOf(snakeShapeOf(opp).ends) & pos.emptyCells();
         int ply = std::min<int>(pos.ply, MAX_PLY - 1);
         int killer1 = killers[ply][0], killer2 = killers[ply][1];
         int count = 0;
-        forEachLegalMove(pos, [&](Move m) {
+        auto add = [&](Move m) {
             if (skip(m)) return;
             const Placement& p = m.placement();
             int score = PIECE_SIZE[p.piece] * 64;      // big pieces first
@@ -593,7 +723,11 @@ class Solver {
             moves[count] = m;
             scores[count] = score;
             count++;
-        });
+        };
+        if (legal)
+            for (int i = 0; i < legalCount; i++) add(legal[i]);
+        else
+            forEachLegalMove(pos, add);
         return count;
     }
 

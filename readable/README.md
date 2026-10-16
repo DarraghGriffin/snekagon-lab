@@ -24,11 +24,11 @@ which `tools/fit_eval.py` writes.
 | 2 | `pieces.hpp` | The 8 pieces, their orientations, all placements (numbered once at start-up), `Move` |
 | 3 | `position.hpp` | `Position`, `play()`, snakes kept up to date incrementally, Zobrist hashing, symmetric keys |
 | 4 | `rules.hpp` | The placement rules: a plain rule check (for either player) and the fast bit-parallel move generator |
-| 5 | `bounds.hpp` | Sound lower and upper bounds on each player's final longest snake, and the clusters behind them |
+| 5 | `bounds.hpp` | Sound lower and upper bounds on each player's final longest snake, the clusters behind them, and the exact one-player optimum (the longest snake a player could still make if the opponent never moved again) |
 | 6 | `features.hpp` | Territory split ("who gets where first") and per-player features |
 | 7 | `evaluation.hpp` | Learned evaluation (logistic regression over 14 features) and the old hand-made one |
 | 8 | `transposition_table.hpp` | Lockless two-slot hash table of the exact solver |
-| 9 | `solver.hpp` | **Exact solver**: alpha-beta over {-1, 0, +1} with a window, threat zones and the last pieces valued without a search, split into steps (table, last pieces, bounds, threats, ordering, search, store) |
+| 9 | `solver.hpp` | **Exact solver**: alpha-beta over {-1, 0, +1} with a window, threat zones and the last pieces valued without a search, the one-player optimum and guaranteed growth near the end, split into steps (table, last pieces, bounds, tight bounds, threats, ordering, search, store) |
 | 10 | `parallel_solve.hpp` | Exact solve of a position, or a yes/no question about it, with its root moves spread over threads |
 | 11 | `screened_win_test.hpp` | Win test that looks for cheap proofs first: the best moves are screened by small probes of their replies |
 | 12 | `engine.hpp` | **Playing engine**: iterative-deepening PVS with forward pruning, multi-PV, score smoothing; in `ab2` also exact verdicts on the root moves |
@@ -72,6 +72,9 @@ proved one reply at a time, read `parallel_solve.hpp`, then `refute.hpp`, then `
 | `LTT` | `TranspositionTable` |
 | `Solver::terminalValue`, `finalScore` | `gameResult`, `redLead` |
 | `Threat`, `addThreat`, `scanThreats`, `threatBound` | `Threat`, `ThreatList::tryPlacement`, `ThreatList::scan`, `ThreatList::boundFor` |
+| `OnePlayer` (`mayReach`, `reachIn`, `dfs`, `queries`, `unreachableAnswers`, `dfsNodes`), `DFS_BUDGET` | `OnePlayerOptimum` (`mayReach`, `reachableInCluster`, `extend`, `stats.questions`, `.unreachable`, `.searchNodes`), `SEARCH_BUDGET` |
+| `Orient::nextTo`, `orientGrowLegal`, `forEachLegalGrow` | `Orientation::anchorsNextTo`, `growingAnchors`, `forEachGrowingMove` |
+| `Solver::growthBounds`, `tightenBounds`, `tightRem`, `pTight` | `guaranteedGrowth`, `Solver::narrowByTightBounds`, `tightBoundsUpToPieces`, `profile.tightCut` |
 | `lastPieces` (`-2`: not the last pieces) | `lastPiecesValue` (`false`) |
 | `pPruned`, `pMoves`, `pLast`, `pScans`, `pScanHits` | `profile.threatSkipped`, `.movesListed`, `.lastPieces`, `.threatScans`, `.threatScansFound` |
 | `PART_*`, `PlyTimer`, `TIMED` (`-DSOLVER_TIMING`) | `Solver::Step`, `NodeTimer`, `timed()` |
@@ -145,6 +148,12 @@ above) were run on the same inputs and the outputs compared with timings removed
 | `gendata` (normal and `good` mode, 1 thread), `refeature`, `evalexplain`, `evaltrace 3` | training rows; features, learned evaluation, fixed-depth search of `ab` |
 | fixed-depth `analyzeWithEngine` / `abAnalyze` of `ab` and `ab2` on two games (1 thread, multi-PV 1 and 8, depths 1-4), from a small test program calling them | depth, scores, displayed scores, verdicts and nodes of every root move |
 | `worker` against a local test coordinator, also with `SOLVER_WIN_TEST=1` | protocol, values and nodes, node budgets, invalid units |
+
+The one-player optimum and the guaranteed growth bounds were ported later. For them, `verify 3000`,
+`BENCH_FRESH=1 BENCH_WINTEST=1 benchset` on the four `bench/ply5_*` sets (also with `BENCH_PNS=1` on
+`ply5_blue_wins.txt` and `ply5_other_openings.txt`) and `solvebench` 9 96 (red bonus -1, 0, +1) and
+6 12 (1 thread) were compared again: identical. With them, `BENCH_WINTEST=1` on `ply5_blue_wins.txt`
+takes 3 811 277 nodes, and `BENCH_PNS=1` 3 105 446.
 
 With several threads the order of the work depends on timing, so those runs were compared by their
 results: `solvepos` with 4 threads (exact, and `SOLVER_WIN_TEST=1` at ply 5), `refute 2` (the same

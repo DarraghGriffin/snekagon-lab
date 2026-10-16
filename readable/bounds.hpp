@@ -175,6 +175,238 @@ inline int upperBoundAfterBlock(const Position& pos, int player, const SnakeClus
     return upper;
 }
 
+// ---- the exact one-player optimum ------------------------------------------------------------
+//
+// Could `player` make a snake of at least `target` cells if the opponent never moved again? This
+// is a relaxation of the real game, so a "no" is a sound upper bound, and a much tighter one than
+// snakeBounds(): it follows how the fixed piece shapes chain into a path.
+//  - The player's future cells are growable cells, and the final snake lies in one cluster.
+//  - The opponent's future cells, the order of the player's moves and the rule that a new snake
+//    touches nothing are dropped: each of them only takes options away.
+//  - The final snake is an induced path of whole old snakes and whole new pieces, and it can be
+//    built by attaching each new piece at an end of the path built so far.
+// A depth-first search builds the path from a seed: an old snake, or, for a path of new pieces
+// only, its lowest piece (by piece number). A path with several old snakes is built from the one
+// with the lowest index only, so merging a snake with a lower index than the seed is skipped. It
+// extends one end, then the other; the extensions are the move generator's grow rules with
+// "touches an own cell" narrowed to "touches the end being extended". A path is given up when its
+// remaining pieces and the snakes they could still merge are too short, and the last piece is
+// placed at either end in one step. Answers are remembered per cluster, keyed by the cluster's
+// cells, the player's cells in it and the pieces left: nothing outside the cluster matters.
+class OnePlayerOptimum {
+  public:
+    static constexpr uint64_t SEARCH_BUDGET = 20000;  // search nodes per cluster; beyond it the answer is "maybe"
+
+    struct Statistics {
+        uint64_t questions = 0;     // asked of mayReach() and not answered by the longest snake alone
+        uint64_t unreachable = 0;   // answered "no"
+        uint64_t searchNodes = 0;
+        uint64_t outOfBudget = 0;   // a cluster's search ran out of budget (the answer was "maybe")
+        void add(const Statistics& o) {
+            questions += o.questions;
+            unreachable += o.unreachable;
+            searchNodes += o.searchNodes;
+            outOfBudget += o.outOfBudget;
+        }
+    } stats;
+
+    void clear() { std::fill(memo.begin(), memo.end(), MemoEntry{}); }
+
+    // False only if `player` surely cannot make a snake of `target` cells; `clusters`: its clusters.
+    bool mayReach(const Position& pos, int player, const SnakeClusters& clusters, int target) {
+        if (pos.longestSnake[player] >= target) return true;
+        PieceSet left = pos.piecesLeft[player];
+        if (!left) return false;
+        stats.questions++;
+        for (int i = 0; i < clusters.count; i++) {
+            if (clusters.upper[i] < target) continue;
+            Bitboard cluster = clusters.cells[i], own = pos.cells[player] & cluster;
+            MemoEntry& known = memo[memoSlot(cluster, own, left)];
+            if (known.cluster != cluster || known.own != own || known.left != left) known = MemoEntry{cluster, own, left};
+            if (known.reachable >= target) return true;
+            if (known.unreachable <= target) continue;
+            Bitboard snakesIn[MAX_SNAKES];
+            int snakesInCount = 0;
+            for (int j = 0; j < pos.snakeCount[player]; j++)
+                if (pos.snakes[player][j] & cluster) snakesIn[snakesInCount++] = pos.snakes[player][j];
+            Answer answer = reachableInCluster(own, cluster & ~pos.cells[player], snakesIn, snakesInCount, left, target);
+            if (answer == UNREACHABLE) {
+                known.unreachable = (int8_t)target;
+                continue;
+            }
+            if (answer == REACHABLE) known.reachable = (int8_t)target;
+            else stats.outOfBudget++;
+            return true;
+        }
+        stats.unreachable++;
+        return false;
+    }
+
+  private:
+    enum Answer { UNREACHABLE = 0, REACHABLE = 1, OUT_OF_BUDGET = -1 };
+    static constexpr int MEMO_LOG2 = 16;
+    struct MemoEntry {
+        Bitboard cluster = 0, own = 0;
+        PieceSet left = 0;
+        int8_t reachable = 0;     // the longest target known to be reachable
+        int8_t unreachable = 127; // the shortest target known to be unreachable
+    };
+    std::vector<MemoEntry> memo = std::vector<MemoEntry>(size_t(1) << MEMO_LOG2);
+
+    static size_t memoSlot(Bitboard cluster, Bitboard own, PieceSet left) {
+        uint64_t h = (uint64_t)cluster * 0x9E3779B97F4A7C15ULL ^ (uint64_t)(cluster >> 64) * 0xC2B2AE3D27D4EB4FULL ^
+                     (uint64_t)own * 0x165667B19E3779F9ULL ^ (uint64_t)(own >> 64) * 0x27D4EB2F165667C5ULL ^ left * 0x85EBCA77C2B2AE63ULL;
+        return (h ^ (h >> 29)) & ((size_t(1) << MEMO_LOG2) - 1);
+    }
+
+    // The question being searched, inside one cluster.
+    Bitboard own = 0, freeCells = 0;  // the player's cells in the cluster, the cluster's growable cells
+    Bitboard snakes[MAX_SNAKES];
+    int snakeLength[MAX_SNAKES], snakeCount = 0;
+    int target = 0;
+    bool newPiecesOnly = false;  // a path of new pieces only: it never touches an old snake ...
+    int seedPiece = 0;           // ... and its other pieces have higher numbers than its seed piece
+    int seedSnake = -1;          // the seed snake: snakes with a lower index are not merged
+    uint64_t searchNodes = 0;
+
+    Answer reachableInCluster(Bitboard own_, Bitboard free_, const Bitboard* snakes_, int count, PieceSet left, int target_) {
+        target = target_;
+        own = own_;
+        freeCells = free_;
+        snakeCount = count;
+        for (int j = 0; j < snakeCount; j++) {
+            snakes[j] = snakes_[j];
+            snakeLength[j] = countCells(snakes[j]);
+        }
+        searchNodes = 0;
+        Answer answer = searchFromSeeds(left);
+        stats.searchNodes += searchNodes;
+        return answer;
+    }
+
+    Answer searchFromSeeds(PieceSet left) {
+        Answer answer = UNREACHABLE;
+        // seeds: the old snakes
+        newPiecesOnly = false;
+        for (int j = 0; j < snakeCount; j++) {
+            seedSnake = j;
+            Bitboard ends = snakeShapeOf(snakes[j]).ends;
+            if (!ends) continue;  // a ring cannot grow
+            Answer a = extend(snakes[j], own, 0, left, firstCell(ends), false);
+            if (a == REACHABLE) return REACHABLE;
+            if (a == OUT_OF_BUDGET) answer = OUT_OF_BUDGET;
+            if (searchNodes > SEARCH_BUDGET) return OUT_OF_BUDGET;
+        }
+        // seeds: paths of new pieces only, seeded by their lowest piece. Such a path lies in one
+        // region of the growable cells away from the old snakes, which must hold target cells.
+        if (cellsInPieces(left) < target) return answer;
+        newPiecesOnly = true;
+        Bitboard awayFromSnakes = freeCells & ~neighboursOf(own), bigRegions = 0;
+        forEachRegion(awayFromSnakes, [&](Bitboard region) {
+            if (pieceTables.bestFill[left][std::min(countCells(region), GRID_SIZE)] >= target) bigRegions |= region;
+        });
+        if (!bigRegions) return answer;
+        for (int piece = 0; piece < NUM_PIECES; piece++) {
+            if (!hasPiece(left, piece)) continue;
+            PieceSet higher = (PieceSet)(left & ~((2u << piece) - 1));
+            if (PIECE_SIZE[piece] + cellsInPieces(higher) < target) continue;
+            seedPiece = piece;
+            for (int o = pieceTables.firstOrientation[piece]; o < pieceTables.firstOrientation[piece + 1]; o++) {
+                const Orientation& orientation = pieceTables.orientations[o];
+                Bitboard anchors = geometry.allCells;
+                for (int k = 0; k < orientation.size; k++) anchors &= cellsWithOffsetIn(bigRegions, orientation.dq[k], orientation.dr[k]);
+                while (anchors) {
+                    const Placement& p = pieceTables.placements[orientation.placementAt[firstCell(anchors)]];
+                    anchors = withoutFirstCell(anchors);
+                    Answer a = extend(p.cells, own | p.cells, p.cells, higher, firstCell(snakeShapeOf(p.cells).ends), false);
+                    if (a == REACHABLE) return REACHABLE;
+                    if (a == OUT_OF_BUDGET) answer = OUT_OF_BUDGET;
+                    if (searchNodes > SEARCH_BUDGET) return OUT_OF_BUDGET;
+                }
+            }
+        }
+        return answer;
+    }
+
+    // Extends the path `path` (a snake of the player's cells `mine`, of which `placed` are new
+    // pieces) with the pieces `left`. keptEnd: the end not extended now; secondEnd: the first end
+    // is finished and the other one is being extended.
+    Answer extend(Bitboard path, Bitboard mine, Bitboard placed, PieceSet left, int keptEnd, bool secondEnd) {
+        int length = countCells(path);
+        if (length >= target) return REACHABLE;
+        if (!left) return UNREACHABLE;
+        if (++searchNodes > SEARCH_BUDGET) return OUT_OF_BUDGET;
+        // too short even with every piece left and the longest snakes they could merge?
+        int most = length + cellsInPieces(left);
+        if (!newPiecesOnly) {
+            int lengths[MAX_SNAKES], count = 0;
+            for (int j = 0; j < snakeCount; j++)
+                if (!(snakes[j] & path)) lengths[count++] = snakeLength[j];
+            std::sort(lengths, lengths + count, std::greater<int>());
+            for (int j = 0; j < std::min(pieceCount(left), count); j++) most += lengths[j];
+        }
+        if (most < target) return UNREACHABLE;
+        SnakeShape shape = snakeShapeOf(mine);
+        Bitboard ends = path & shape.ends;  // the path is one snake of `mine`
+        if (!ends) return UNREACHABLE;      // a ring
+        int end = countCells(ends) == 1 ? firstCell(ends) : (ends & ~cellBit(keptEnd)) ? firstCell(ends & ~cellBit(keptEnd)) : firstCell(ends);
+        Bitboard activeEnds = secondEnd ? cellBit(end) : ends;
+        // with one piece left, placing it at either active end is the last step
+        bool lastPiece = pieceCount(left) == 1;
+        int childKeptEnd = countCells(ends) == 1 ? end : keptEnd;
+        Bitboard extendAt = lastPiece ? activeEnds : cellBit(end);
+        int end0 = firstCell(extendAt), end1 = withoutFirstCell(extendAt) ? firstCell(withoutFirstCell(extendAt)) : end0;
+
+        // the extensions, bit-parallel per orientation (growingAnchors with "touches an own cell"
+        // narrowed to "touches the end being extended")
+        Bitboard usable = freeCells & ~placed;
+        if (newPiecesOnly) usable &= ~neighboursOf(own);
+        Bitboard notNextToBody = usable & ~neighboursOf(shape.body);
+        Bitboard allowed[3] = {notNextToBody & ~shape.touches3 & ~shape.touchesAdjacentPair, notNextToBody & ~shape.touches2,
+                               notNextToBody & ~shape.touches1};
+        Bitboard mineWithNeighbour = mine & shape.touches1;
+        Answer answer = UNREACHABLE;
+        for (int piece = NUM_PIECES - 1; piece >= 0; piece--) {  // big pieces first: a path that reaches is found sooner
+            if (!hasPiece(left, piece) || (newPiecesOnly && piece <= seedPiece)) continue;
+            for (int o = pieceTables.firstOrientation[piece]; o < pieceTables.firstOrientation[piece + 1]; o++) {
+                const Orientation& orientation = pieceTables.orientations[o];
+                Bitboard anchors = orientation.anchorsNextTo[end0] | orientation.anchorsNextTo[end1];
+                for (int k = 0; k < orientation.size && anchors; k++)
+                    anchors &= cellsWithOffsetIn(allowed[orientation.innerNeighbours[k]], orientation.dq[k], orientation.dr[k]);
+                if (!anchors) continue;
+                for (auto [q, r] : orientation.wedgeCells) anchors &= ~cellsWithOffsetIn(mine, q, r);
+                for (auto [q, r] : orientation.bridgeCells) anchors &= ~cellsWithOffsetIn(mineWithNeighbour, q, r);
+                while (anchors) {
+                    const Placement& p = pieceTables.placements[orientation.placementAt[firstCell(anchors)]];
+                    anchors = withoutFirstCell(anchors);
+                    // the piece joins the path and every old snake it touches
+                    Bitboard longer = path | p.cells;
+                    bool mergesLowerSnake = false;
+                    for (int j = 0; j < snakeCount; j++)
+                        if ((snakes[j] & p.border) && !(snakes[j] & path)) {
+                            if (!newPiecesOnly && j < seedSnake) mergesLowerSnake = true;
+                            longer |= snakes[j];
+                        }
+                    if (lastPiece) {
+                        if (countCells(longer) >= target) return REACHABLE;
+                        continue;
+                    }
+                    if (mergesLowerSnake) continue;
+                    Answer a = extend(longer, mine | p.cells, placed | p.cells, (PieceSet)(left & ~(1u << piece)), childKeptEnd, secondEnd);
+                    if (a == REACHABLE) return REACHABLE;
+                    if (a == OUT_OF_BUDGET) answer = OUT_OF_BUDGET;
+                    if (searchNodes > SEARCH_BUDGET) return OUT_OF_BUDGET;
+                }
+            }
+        }
+        if (!lastPiece && !secondEnd && countCells(ends) == 2) {
+            Answer a = extend(path, mine, placed, left, end, true);
+            if (a != UNREACHABLE) return a;
+        }
+        return answer;
+    }
+};
+
 // The same bounds computed the slow, obvious way (flooding own + growable cells directly).
 // `snek verify` checks that snakeBounds() always agrees with it.
 inline SnakeBounds snakeBoundsReference(const Position& pos, int player) {

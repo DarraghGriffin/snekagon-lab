@@ -136,18 +136,22 @@ int cmdSolveBench(const Args& args) {
     return 0;
 }
 
-// Per ply: nodes visited and how they ended - table cutoff, last pieces, bound cutoff, expanded -,
-// the share of the moves that threat zones skipped, threat scans and how often they found a threat.
-static void printProfile(const Solver::Profile& p) {
+// Per ply: nodes visited and how they ended - table cutoff, last pieces, bound cutoff, tight-bound
+// cutoff, expanded -, the share of the moves that threat zones skipped, threat scans and how often
+// they found a threat; then the one-player optimum's questions.
+static void printProfile(const Solver::Profile& p, const OnePlayerOptimum::Statistics& onePlayer) {
     auto percent = [](uint64_t part, uint64_t whole) { return whole ? 100.0 * part / whole : 0.0; };
-    printf("ply     visited    tt-cut  last-pcs  bound-cut  expanded  threat-skip     scans  found\n");
+    printf("ply     visited    tt-cut  last-pcs  bound-cut  tight-cut  expanded  threat-skip     scans  found\n");
     for (int ply = 0; ply < 16; ply++)
         if (p.visited[ply])
-            printf("%3d %11llu %9.1f%% %8.1f%% %9.1f%% %9.1f%% %9.1f%% %9llu %5.1f%%\n", ply, (unsigned long long)p.visited[ply],
+            printf("%3d %11llu %9.1f%% %8.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9llu %5.1f%%\n", ply, (unsigned long long)p.visited[ply],
                    percent(p.tableCut[ply], p.visited[ply]), percent(p.lastPieces[ply], p.visited[ply]),
-                   percent(p.boundCut[ply], p.visited[ply]), percent(p.expanded[ply], p.visited[ply]),
+                   percent(p.boundCut[ply], p.visited[ply]), percent(p.tightCut[ply], p.visited[ply]), percent(p.expanded[ply], p.visited[ply]),
                    percent(p.threatSkipped[ply], p.threatSkipped[ply] + p.movesListed[ply]), (unsigned long long)p.threatScans[ply],
                    percent(p.threatScansFound[ply], p.threatScans[ply]));
+    printf("one-player queries %llu, cannot reach %.1f%%, %.1f search nodes per query, %llu out of budget\n",
+           (unsigned long long)onePlayer.questions, percent(onePlayer.unreachable, onePlayer.questions),
+           onePlayer.questions ? (double)onePlayer.searchNodes / onePlayer.questions : 0.0, (unsigned long long)onePlayer.outOfBudget);
 #ifdef SOLVER_TIMING
     uint64_t totalTime = 0;
     for (int ply = 0; ply < 16; ply++) totalTime += p.time[ply];
@@ -199,6 +203,7 @@ int cmdBenchSet(const Args& args) {
     std::atomic<size_t> next{0};
     std::mutex profileLock;
     Solver::Profile total;
+    OnePlayerOptimum::Statistics totalOnePlayer;
     int sharedLog2 = envInt("SOLVER_SHARED", 0);
     std::shared_ptr<TranspositionTable> sharedTable = sharedLog2 ? std::make_shared<TranspositionTable>(sharedLog2 - 1) : nullptr;
     auto start = std::chrono::steady_clock::now();
@@ -226,6 +231,8 @@ int cmdBenchSet(const Args& args) {
                 std::lock_guard<std::mutex> lock(profileLock);
                 total.add(solver.profile);
                 solver.profile = Solver::Profile{};
+                totalOnePlayer.add(solver.onePlayerStatistics());
+                solver.resetOnePlayerStatistics();
             }
             seconds[i] = secondsSince(positionStart);
         }
@@ -244,6 +251,6 @@ int cmdBenchSet(const Args& args) {
     }
     printf("TOTAL %zu positions: %llu nodes, %.1f thread-seconds, %.1f s wall (%d threads)\n", positions.size(),
            (unsigned long long)totalNodes, threadSeconds, wall, threads);
-    if (getenv("PROFILE")) printProfile(total);
+    if (getenv("PROFILE")) printProfile(total, totalOnePlayer);
     return 0;
 }
