@@ -34,6 +34,7 @@ struct LTT {
         return uint64_t(lo + 2) | uint64_t(hi + 2) << 3 | uint64_t(best + 1) << 6 | uint64_t(work) << 22 | uint64_t(check) << 32;
     }
     static bool holds(uint64_t k, uint64_t d, uint64_t key, uint32_t check) { return (k ^ d) == key && uint32_t(d >> 32) == check; }
+    void prefetch(uint64_t key) const { __builtin_prefetch(&s[(key & mask) * 2]); }
     bool probe(uint64_t key, uint32_t check, int& lo, int& hi, int& best) const {
         size_t b = (key & mask) * 2;
         for (int i = 0; i < 2; i++) {
@@ -577,6 +578,9 @@ struct Solver {
                     int tb = threatBound(moves[i].pl().m, threats, nThreats);
                     if (tb <= alpha) { skipped = std::max(skipped, tb); pPruned[pp]++; continue; }
                 }
+                // once the rest is sorted the next move is known: its table entry is fetched from memory
+                // while this move is searched
+                if (i >= FULL_SORT_AFTER && i + 1 < n && s.ply >= SYM_PLY) tt->prefetch(s.keyAfter(moves[i + 1]));
                 Pos c;
                 TIMED(PART_CHILD, c = s; c.play(moves[i]));
                 int v = -search(c, -beta, -alpha);

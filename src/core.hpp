@@ -379,6 +379,14 @@ struct Pos {
         for (int u = 1; u < NSYM; u++) if (h[u] < h[t]) t = u;
         return h[t];
     }
+    // The key of the position after move m (not a pass), without making it; only once the symmetric
+    // hashes are no longer kept (ply >= SYM_PLY), where play() updates h[0] alone.
+    uint64_t keyAfter(Move m) const {
+        const Placement& pl = m.pl();
+        uint64_t x = h[0] ^ T.zPiece[stm][pl.piece] ^ T.zStm;
+        for (int j = 0; j < pl.n; j++) x ^= T.zCell[stm][pl.c[j]];
+        return x;
+    }
     // 32 more bits that tell positions with the same key apart (the transposition table stores them),
     // from the cells and pieces, independently of the Zobrist key. Near the root, where the key is
     // symmetry-canonical, it is 0 (those few positions do not need it).
