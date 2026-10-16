@@ -183,8 +183,9 @@ inline int upperBoundAfterBlock(const Position& pos, int player, const SnakeClus
 //  - The player's future cells are growable cells, and the final snake lies in one cluster.
 //  - The opponent's future cells, the order of the player's moves and the rule that a new snake
 //    touches nothing are dropped: each of them only takes options away.
-//  - The final snake is an induced path of whole old snakes and whole new pieces, and it can be
-//    built by attaching each new piece at an end of the path built so far.
+//  - The final snake is an induced path or ring of whole old snakes and whole new pieces, and it
+//    can be built by attaching each new piece at an end of the path built so far (a ring is
+//    closed by the last one).
 // A depth-first search builds the path from a seed: an old snake, or, for a path of new pieces
 // only, its lowest piece (by piece number). A path with several old snakes is built from the one
 // with the lowest index only, so merging a snake with a lower index than the seed is skipped. It

@@ -635,8 +635,8 @@ inline int lengthAfter(const Pos& s, int c, const Placement& pl) {
 //  - c's future cells are growable cells, and the final snake lies in one cluster (as above);
 //  - the opponent's future cells, the order of c's moves and the rule that a new snake touches
 //    nothing are dropped (each only removes options);
-//  - the final snake is an induced path of whole old snakes and whole new pieces, each new piece
-//    attached at an end of the path built so far.
+//  - the final snake is an induced path or ring of whole old snakes and whole new pieces, each new
+//    piece attached at an end of the path built so far (a ring is closed by the last one).
 // A depth-first search grows the path from a seed: an old snake (merging an old snake with a lower
 // index is skipped, that path is grown from that snake), or for a path of new pieces only, its
 // lowest piece. It extends one end, then the other, with the grow rules of orientLegal narrowed
