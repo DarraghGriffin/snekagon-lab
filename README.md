@@ -497,8 +497,8 @@ A worker's threads share one transposition table that is kept from unit to unit 
 Runs both halves of the centre opening's proof on one machine and resumes after a stop or a crash:
 
 ```bash
-python tools/centre_solve.py --snek build/snek.exe --run build/centre_run --threads 14   # start or resume
-python tools/centre_solve.py --run build/centre_run --stop                               # stop (or Ctrl+C)
+python tools/centre_solve.py --snek build/centre/snek.exe --run build/centre_run --threads 14   # start or resume
+python tools/centre_solve.py --run build/centre_run --stop                                      # stop (or Ctrl+C)
 ```
 
 - **red's half** ("blue cannot win"): one `PROVELINE_SEARCH=5 snek proveline` line per blue reply to `1:60`
@@ -506,7 +506,8 @@ python tools/centre_solve.py --run build/centre_run --stop                      
   once at the start by 5 s searches on all threads (`<line>/order.txt`). A line that passes its first-pass
   cap (`--red-cap`, 3 thread-hours) is deferred and resumed without a cap when no line is pending.
 - **blue's half** ("red cannot win"): after blue's `4B:16,27,28,39`, a `REFUTE_LOSS=1 snek refute` step per
-  red reply, with the blue answers that held most often first (`REFUTE_FIRST`). Red's 50 strongest replies by
+  red reply, which proves the 3 blue answers that held most often first (`REFUTE_FIRST`, `--first-answers`), then
+  the engine's 2 best (`REFUTE_PROVE_TOP`, `--prove-top`), and only then sweeps. Red's 50 strongest replies by
   a 5 s search run first and without a cap, the rest with a first-pass cap (`--blue-cap`, 0.5 thread-hours).
   A step that loses moves blue's half to `3V:36,37,48`, then `4A:51,52,63,74`.
 - The threads are split between the halves (`--red-share`, 0.4) in processes of `--proc-threads` (2), at
@@ -558,7 +559,7 @@ else. Before the run starts the page waits for `state.json`.
 | `snek gendata <games> <plyMin> <plyMax> <solveSec> <threads> <seed>` | labelled positions (features + exact value) as CSV |
 | `python tools/fit_eval.py data/*.csv` | fit the evaluation → `src/eval_weights.hpp`, `data/weights_latest.txt` |
 | `snek solvepos <sec> <threads> <moves…>` | parallel exact solve of a position (`PROGRESS=<file>` logs and resumes; `SOLVER_WIN_TEST=1` only proves or refutes that the side to move loses: each root move is `loss` or `notloss`, much cheaper) |
-| `snek refute <threads> <log> <moves…>` | shows that the side to move cannot win (`REFUTE_LOSS=1`: that it loses), or finds a move that survives: for every move a reply after which the mover does not win (replies that refuted other moves first, then by the evaluation; `REFUTE_TRIES` × `REFUTE_NODES` M nodes), then a full search over all replies for the moves left open, in chunks of `REFUTE_CHUNK` moves; `REFUTE_FIRST=<file>` settles the listed moves first (answers that won against sibling replies often win again); the moves are taken in the evaluation's order after the 8 best of a `REFUTE_SEARCH` (2) second engine search, which ranks easy winners far higher. All of a sweep's solves share one transposition table, kept from unit to unit (`SOLVER_SWEEP_TT=<log2 entries>`, default 25: 512 MB per process). Resumable log, headed by the position, `REFUTE_LOSS` and `SOLVER_RED_BONUS` (a log for anything else is refused); every refutation is one position anyone can re-solve |
+| `snek refute <threads> <log> <moves…>` | shows that the side to move cannot win (`REFUTE_LOSS=1`: that it loses), or finds a move that survives: for every move a reply after which the mover does not win (replies that refuted other moves first, then by the evaluation; `REFUTE_TRIES` × `REFUTE_NODES` M nodes), then a full search over all replies for the moves left open, in chunks of `REFUTE_CHUNK` moves; `REFUTE_FIRST=<file>` proves the listed moves first, in their order (answers that won against sibling replies often win again), and `REFUTE_PROVE_TOP=<k>` then the k best of the order below, before any refutation tries; the moves are taken in the evaluation's order after the 8 best of a `REFUTE_SEARCH` (2) second engine search, which ranks easy winners far higher. All of a sweep's solves share one transposition table, kept from unit to unit (`SOLVER_SWEEP_TT=<log2 entries>`, default 25: 512 MB per process). Resumable log, headed by the position, `REFUTE_LOSS` and `SOLVER_RED_BONUS` (a log for anything else is refused); every refutation is one position anyone can re-solve |
 | `snek proveline <threads> <dir> <moves…>` | settles every reply of the side to move with `refute` for the opponent: an answer that wins against all replies after it, or proof that the opponent cannot win there. Answers that won against earlier replies are tried first; `dir/summary.txt` (one line per reply) and the sweeps' logs make it resumable, so one machine can work through a whole line. It stops at the first reply after which the opponent cannot win, which settles the line (`PROVELINE_ALL=1` goes on), e.g. `snek proveline 16 centre 1:60 4B:16,27,28,39`. `PROVELINE_SEARCH=<s>` takes the replies in the order of an `<s>` second engine search (its 8 best, then the evaluation's order), kept in `dir/order.txt` for reruns |
 | `snek uniquemoves <sec> <top> <threads> <moves…> [-- <move>…]` | the side to move's symmetry-unique moves, best first (the `<top>` best of a `<sec>` second search, then the evaluation's order), with the position and the search depth; moves after `--` are mapped to their representative |
 | `snek solvebench <plies> <n> <sec> <threads>` | solver benchmark on random positions (`SOLVER_PNS=1`: values from two `PnSearch` win tests) |

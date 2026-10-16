@@ -67,6 +67,7 @@ class RefutationSweep {
     uint64_t nodeBudget = (uint64_t)envInt("REFUTE_NODES", 60) * 1000000;  // pass 1: nodes per win test
     size_t chunk = std::max(1, envInt("REFUTE_CHUNK", 64));               // attacker moves per round of the passes
     int searchSeconds = envInt("REFUTE_SEARCH", 2);                        // engine search that picks the first moves
+    int proveTop = envInt("REFUTE_PROVE_TOP", 0);                          // the best moves in that order proved before pass 1
 
     RefutationSweep(const Position& root, int threads) : root(root), threads(threads) {}
 
@@ -97,7 +98,13 @@ class RefutationSweep {
             Move m;
             if (!parseMove(text, m) || std::find(all.begin(), all.end(), m) == all.end()) continue;
             if (!status.count(moveToString(m))) status[moveToString(m)] = "open";
+            if (std::find(proveOrder.begin(), proveOrder.end(), m) == proveOrder.end()) proveOrder.push_back(m);
         }
+        for (Move m : bestFirst)
+            if (std::find(proveOrder.begin(), proveOrder.end(), m) == proveOrder.end()) proveOrder.push_back(m);
+        // and so are the best proveTop moves: one that survives is proved without refutation tries first
+        for (int i = 0; i < proveTop && i < (int)bestFirst.size(); i++)
+            if (!status.count(moveToString(bestFirst[i]))) status[moveToString(bestFirst[i])] = "open";
         fullPass();
         for (size_t from = 0; from < todo.size() && survivor.empty(); from += chunk) {
             quickPass(todo, from, std::min(todo.size(), from + chunk));
@@ -122,6 +129,7 @@ class RefutationSweep {
     std::map<std::string, std::string> status;  // attacker move -> "refuted", "open", "wins" or "holds"
     std::map<int, int> refutations;             // defender reply (placement id) -> attacker moves it refuted
     std::vector<Move> bestFirst;                // all attacker moves, in the order they are settled
+    std::vector<Move> proveOrder;               // pass 2's order: the moves in `first` (in their order), then bestFirst
     std::string survivor;
     FILE* log = nullptr;
     std::mutex lock;                            // status, refutations, log and stdout during pass 1
@@ -242,7 +250,7 @@ class RefutationSweep {
     // Pass 2 on every open move, the attacker's best first: all of the defender's replies, which
     // either refutes the move or proves that it survives.
     void fullPass() {
-        for (Move m : bestFirst) {
+        for (Move m : proveOrder) {
             std::string move = moveToString(m);
             if (!survivor.empty()) return;
             if (statusOf(move) != "open") continue;

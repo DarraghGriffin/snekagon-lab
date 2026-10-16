@@ -778,7 +778,7 @@ class Driver:
         out = self.path(piece.rel_out())
         out.parent.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
-        for k in ("REFUTE_LOSS", "REFUTE_FIRST", "SOLVER_RED_BONUS", "PROVELINE_ALL"):
+        for k in ("REFUTE_LOSS", "REFUTE_FIRST", "REFUTE_PROVE_TOP", "SOLVER_RED_BONUS", "PROVELINE_ALL"):
             env.pop(k, None)
         first = []
         if piece.half == "red":
@@ -794,6 +794,7 @@ class Driver:
             write_atomic(self.path("blue_answers.txt"), "".join(a + "\n" for a in first))
             env["REFUTE_LOSS"] = "1"
             env["REFUTE_FIRST"] = str(self.path("blue_answers.txt"))
+            env["REFUTE_PROVE_TOP"] = str(self.args.prove_top)
             cmd = [self.snek.exe, "refute", str(threads), str(self.path(piece.rel_log())), *piece.moves]
         with open(out, "ab") as f:
             f.write(f"\n{ATTEMPT_MARK}{now_iso()} threads {threads} cap {cap}\n".encode())
@@ -1135,6 +1136,7 @@ def main():
     ap.add_argument("--blue-search", type=float, default=5, help="seconds of the search that ranks red's replies")
     ap.add_argument("--red-search", type=int, default=5, help="PROVELINE_SEARCH seconds for red's lines")
     ap.add_argument("--first-answers", type=int, default=3, help="blue answers that held most often, tried first in a step")
+    ap.add_argument("--prove-top", type=int, default=2, help="the search's best blue answers, also proved before a step's sweep")
     ap.add_argument("--repo", default=str(REPO), help="the repository whose results/ and build/ hold earlier proofs")
     args = ap.parse_args()
     if args.stop:

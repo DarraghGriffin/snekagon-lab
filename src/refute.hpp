@@ -8,7 +8,8 @@
 // that the move survives. Both passes alternate on chunks of REFUTE_CHUNK (64) attacker moves and
 // stop at the first move that survives, so a strong move is proved without refuting every weaker one.
 // Attacker moves are taken in the evaluation's order after the 8 best of a REFUTE_SEARCH (2) second
-// engine search; moves in `first` (answers that survived in sibling positions) are settled before all.
+// engine search; moves in `first` (answers that survived in sibling positions) are proved before all,
+// in their given order, then (REFUTE_PROVE_TOP=<k>, default 0) the k best of that order, before pass 1.
 // Every solve of the sweep, in both passes and all threads, uses one transposition table
 // (makeSweepTable, SOLVER_SWEEP_TT): the units are siblings and share much of their trees.
 // Log lines (resumable; every refutation is one position anyone can re-solve):
@@ -156,10 +157,12 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
             });
         for (auto& t : th) t.join();
     };
-    // pass 2 on every open move, attacker's best first: the defender's whole reply list, either a
-    // refutation or a proof that the move survives - which settles the question
+    // pass 2 on every open move, the moves in `first` first (in their order), then the attacker's best
+    // first: the defender's whole reply list, either a refutation or a proof that the move survives -
+    // which settles the question
+    std::vector<Move> proveOrder;
     auto fullPass = [&] {
-        for (auto& [sc, m] : ranked) {
+        for (Move m : proveOrder) {
             std::string ms = moveStr(m);
             if (!survivor.empty()) return;
             auto it = status.find(ms);
@@ -190,7 +193,15 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
         Move fm;
         if (!parseMove(tok, fm) || std::find(all.begin(), all.end(), fm) == all.end()) continue;
         if (!status.count(moveStr(fm))) status[moveStr(fm)] = "open";
+        if (std::find(proveOrder.begin(), proveOrder.end(), fm) == proveOrder.end()) proveOrder.push_back(fm);
     }
+    for (auto& [sc, m] : ranked)
+        if (std::find(proveOrder.begin(), proveOrder.end(), m) == proveOrder.end()) proveOrder.push_back(m);
+    // REFUTE_PROVE_TOP=<k>: the k best moves of the order above also get a full search before any
+    // pass 1 (a move that survives is proved at once, without spending refutation tries on it first)
+    int proveTop = envInt("REFUTE_PROVE_TOP", 0);
+    for (int i = 0; i < proveTop && i < (int)ranked.size(); i++)
+        if (!status.count(moveStr(ranked[i].second))) status[moveStr(ranked[i].second)] = "open";
     size_t chunk = std::max(1, envInt("REFUTE_CHUNK", 64));
     fullPass();
     for (size_t from = 0; from < todo.size() && survivor.empty(); from += chunk) {
