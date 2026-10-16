@@ -531,8 +531,9 @@ inline int longest(BB b) {
     return best;
 }
 inline int remainingCells(uint8_t av) {
-    static_assert(PIECE_CELLS[P1] == 1 && PIECE_CELLS[P2] == 2 && PIECE_CELLS[P3I] == 3 && PIECE_CELLS[P3V] == 3 && PIECE_CELLS[P4I] == 4 &&
-                  PIECE_CELLS[P4C] == 4);
+    // pieces 0-1 have 1 and 2 cells, 2-3 three, 4-7 four
+    static_assert(PIECE_CELLS[P1] == 1 && PIECE_CELLS[P2] == 2 && PIECE_CELLS[P3I] == 3 && PIECE_CELLS[P3V] == 3 &&
+                  PIECE_CELLS[P4I] == 4 && PIECE_CELLS[P4A] == 4 && PIECE_CELLS[P4B] == 4 && PIECE_CELLS[P4C] == 4);
     return (av & 1) + (av & 2) + 3 * __builtin_popcount(av & 0x0C) + 4 * __builtin_popcount(av & 0xF0);
 }
 inline int pieceCount(uint8_t av) { return __builtin_popcount(av); }
