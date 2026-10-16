@@ -358,8 +358,8 @@ killer moves and the one-player memo are reset for each position (`Solver::newPo
 over from another position are tried first and cost 13–28 % more nodes. `parallelSolve` (pass 2, which is all
 of a blue's-half step whose known answer holds) resets them before every root move, and the distributed worker
 works like a sweep. A table entry also carries a 32-bit check of the position: the key bits that pick the bucket
-verify nothing, and a 2^25-entry table would otherwise take one position for another about once in 2^40
-probes, about once in a run of 10^12 nodes. Measured on the shared laptop (node counts exact, seconds
+verify nothing, and a 2^25-entry table would otherwise take one position for another about once in 2^39
+probes, about twice in a run of 10^12 nodes. Measured on the shared laptop (node counts exact, seconds
 approximate), before and after:
 
 | | before | after |

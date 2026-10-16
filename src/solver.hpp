@@ -19,7 +19,7 @@
 // Slot 0 of a bucket keeps the entry with the most work behind it, slot 1 is always replaced.
 // The key bits that pick the bucket verify nothing, so an entry also carries the position's 32-bit
 // keyCheck(): without it a 2^25-entry table would take a different position for the probed one about
-// once in 2^40 probes, which a proof running 10^12 nodes cannot afford.
+// once in 2^39 probes (40 bits checked, two slots), which a proof running 10^12 nodes cannot afford.
 struct LTT {
     struct Slot { std::atomic<uint64_t> k{0}, d{0}; };
     std::unique_ptr<Slot[]> s;

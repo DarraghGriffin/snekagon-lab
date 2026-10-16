@@ -8,7 +8,7 @@
 // always replaced.
 // The key bits that pick the bucket verify nothing, so an entry also carries the position's 32-bit
 // keyCheck(): without it a 2^25-entry table would take a different position for the probed one about
-// once in 2^40 probes, which a proof running 10^12 nodes cannot afford.
+// once in 2^39 probes (40 bits checked, two slots), which a proof running 10^12 nodes cannot afford.
 #pragma once
 #include <atomic>
 #include <cstdint>
