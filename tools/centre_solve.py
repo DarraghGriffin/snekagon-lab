@@ -46,6 +46,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 CENTRE = "1:60"
@@ -54,6 +55,7 @@ STATE_SECONDS = 5.0      # state.json is rewritten at most this often (and on ev
 HISTORY_SECONDS = 300.0  # one history point per 5 minutes
 EVENTS_KEPT = 300
 MAX_ERRORS = 2           # a piece whose process fails this often is left as an error
+MAX_LOOP_FAILURES = 30   # the driver stops after this many failed passes of its loop in a row
 PRIOR_THREAD_SECONDS = {"red": 1800.0, "blue": 300.0}  # ETA per piece before any piece of a half finished here
 
 REPO = Path(__file__).resolve().parent.parent
@@ -118,9 +120,18 @@ def move_from_safe(name):
 
 
 def write_atomic(path, text):
+    """Writes a temporary file and renames it over `path`. On Windows the rename fails while another
+    process holds `path` open without delete sharing (a reader), so it is retried for a while."""
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    for attempt in range(40):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 39:
+                raise
+            time.sleep(0.05)
 
 
 def append_jsonl(path, record):
@@ -957,7 +968,11 @@ class Driver:
             "events": self.events,
             "history": self.history,
         }
-        write_atomic(self.path("state.json"), json.dumps(state, separators=(",", ":")))
+        try:
+            write_atomic(self.path("state.json"), json.dumps(state, separators=(",", ":")))
+        except OSError as e:  # a reader held the file the whole time: the next pass writes it
+            print(f"{now_iso()} state.json not written: {e}", file=sys.stderr, flush=True)
+            return
         self.last_state, self.dirty = t, False
 
     def red_line(self, p):
@@ -988,6 +1003,22 @@ class Driver:
                 "phase": g.phase, "done": g.done(), "total": g.total, "detail": detail, "out": r.piece.rel_out()}
 
     # -- main loop -----------------------------------------------------------------------------------
+    def step(self):
+        """One pass of the loop: finished processes, the verdict, new processes, state.json.
+        False when the loop should end."""
+        self.poll()
+        self.check_verdict()
+        if self.verdict:
+            return False
+        self.schedule()
+        if not self.running and not any(self.candidates(h) for h in ("red", "blue")):
+            failed = sum(1 for p in list(self.red.values()) + list(self.blue.values()) if p.status == "error")
+            self.event("info", "run", "", f"nothing left to run: {failed} pieces failed {MAX_ERRORS} times (see the errors above)")
+            return False
+        if self.dirty or time.time() - self.last_state >= STATE_SECONDS:
+            self.write_state()
+        return True
+
     def request_stop(self, *_):
         self.stop_requested = True
 
@@ -1030,21 +1061,22 @@ class Driver:
             self.red_orders()
             self.status = "running"
             self.check_verdict()
+            failures = 0
             while not self.stop_requested and not self.verdict:
                 if self.path("STOP").exists():
                     self.stop_requested = True
                     break
-                self.poll()
-                self.check_verdict()
-                if self.verdict:
-                    break
-                self.schedule()
-                if not self.running and not any(self.candidates(h) for h in ("red", "blue")):
-                    failed = sum(1 for p in list(self.red.values()) + list(self.blue.values()) if p.status == "error")
-                    self.event("info", "run", "", f"nothing left to run: {failed} pieces failed {MAX_ERRORS} times (see the errors above)")
-                    break
-                if self.dirty or time.time() - self.last_state >= STATE_SECONDS:
-                    self.write_state()
+                try:
+                    if not self.step():
+                        break
+                    failures = 0
+                except Exception as e:  # a multi-day run outlives one bad pass: report it and go on
+                    failures += 1
+                    traceback.print_exc()
+                    self.event("error", "run", "", f"driver loop: {e!r} ({failures} in a row)")
+                    if failures >= MAX_LOOP_FAILURES:
+                        break
+                    time.sleep(5.0)
                 time.sleep(1.0)
             self.status = "stopping"
             self.write_state()
@@ -1069,6 +1101,14 @@ def stop(run):
     lock = run / "driver.pid"
     if not lock.exists():
         print(f"no driver runs on {run}")
+        return 0
+    try:
+        pid = int(lock.read_text().split()[0])
+    except (ValueError, IndexError):
+        pid = 0
+    if not pid_alive(pid):
+        lock.unlink(missing_ok=True)
+        print(f"no driver runs on {run} (removed the stale driver.pid of process {pid})")
         return 0
     (run / "STOP").write_text("stop\n")
     for _ in range(120):

@@ -522,7 +522,8 @@ piece, with its thread-seconds and source), `pieces/` (the processes' logs and s
 threads), `summary` (thread-seconds, pieces done, ETA, verdict), `red.lines` (per blue reply: rating,
 status, the red reply that holds and its rank), `blue.replies` (per red reply: rank, status, blue's
 answer, whether it needed the full sweep), `running` (each process's moves, phase and progress), the last
-300 `events` and a `history` point per 5 minutes.
+300 `events` and a `history` point per 5 minutes. Readers should open, read and close it at once: on
+Windows a reader that holds it open blocks the rename (the driver retries for 2 s, then skips that write).
 
 ## Tools
 
