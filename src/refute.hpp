@@ -180,7 +180,9 @@ inline RefuteResult refuteMoves(const Pos& s, int threads, const std::string& lo
                     break;
                 }
             fflush(log);
-            printf("pass 2: %s %s (%llu nodes, %.1f s)\n", ms.c_str(), status[ms].c_str(), (unsigned long long)r.nodes, r.seconds);
+            // progress drivers parse "pass 2: <move> <status>" as a whole line; the cost has its own
+            printf("pass 2: %s %s\n", ms.c_str(), status[ms].c_str());
+            printf("pass 2 cost: %s %llu nodes, %.1f s\n", ms.c_str(), (unsigned long long)r.nodes, r.seconds);
             fflush(stdout);
         }
     };

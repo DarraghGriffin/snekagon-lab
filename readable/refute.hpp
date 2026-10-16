@@ -264,7 +264,9 @@ class RefutationSweep {
                     break;
                 }
             fflush(log);
-            printf("pass 2: %s %s (%llu nodes, %.1f s)\n", move.c_str(), statusOf(move).c_str(), (unsigned long long)r.nodes, r.seconds);
+            // progress drivers parse "pass 2: <move> <status>" as a whole line; the cost has its own
+            printf("pass 2: %s %s\n", move.c_str(), statusOf(move).c_str());
+            printf("pass 2 cost: %s %llu nodes, %.1f s\n", move.c_str(), (unsigned long long)r.nodes, r.seconds);
             fflush(stdout);
         }
     }
