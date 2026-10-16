@@ -1049,6 +1049,7 @@ class Driver:
                 return 1
             self.setup()
             self.replay()
+            self.write_state()  # its running list now holds this driver's processes: none yet
             self._imported = self.imported_sources()
             self.event("info", "run", "", f"driver started: {self.args.threads} threads, {self.snek.exe}")
             self.import_red()
