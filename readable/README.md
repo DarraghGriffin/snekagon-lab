@@ -74,7 +74,7 @@ proved one reply at a time, read `parallel_solve.hpp`, then `refute.hpp`, then `
 | `Threat`, `addThreat`, `scanThreats`, `threatBound` | `Threat`, `ThreatList::tryPlacement`, `ThreatList::scan`, `ThreatList::boundFor` |
 | `OnePlayer` (`mayReach`, `reachIn`, `dfs`, `queries`, `unreachableAnswers`, `dfsNodes`), `DFS_BUDGET` | `OnePlayerOptimum` (`mayReach`, `reachableInCluster`, `extend`, `stats.questions`, `.unreachable`, `.searchNodes`), `SEARCH_BUDGET` |
 | `Orient::nextTo`, `orientGrowLegal`, `forEachLegalGrow` | `Orientation::anchorsNextTo`, `growingAnchors`, `forEachGrowingMove` |
-| `Solver::growthBounds`, `tightenBounds`, `tightRem`, `pTight` | `guaranteedGrowth`, `Solver::narrowByTightBounds`, `tightBoundsUpToPieces`, `profile.tightCut` |
+| `Solver::growthBounds`, `tightenBounds`, `restBounds`, `tightRem`, `tightAllNodeRem`, `pTight` | `guaranteedGrowth`, `Solver::narrowByTightBounds` (also for the moves left at an all-node, step 6 of `search`), `tightBoundsUpToPieces`, `allNodeTightBoundsUpToPieces`, `profile.tightCut` |
 | `lastPieces` (`-2`: not the last pieces) | `lastPiecesValue` (`false`) |
 | `pPruned`, `pMoves`, `pLast`, `pScans`, `pScanHits` | `profile.threatSkipped`, `.movesListed`, `.lastPieces`, `.threatScans`, `.threatScansFound` |
 | `PART_*`, `PlyTimer`, `TIMED` (`-DSOLVER_TIMING`) | `Solver::Step`, `NodeTimer`, `timed()` |
