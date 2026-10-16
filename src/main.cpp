@@ -726,7 +726,8 @@ int main(int argc, char** argv) {
     } else if (mode == "arena") {
         // engine A vs engine B from random openings (random 1-hex + random reply),
         // every opening played twice with colours swapped. ARENA_BOOK=<file>: the openings of
-        // that book (snek book) instead, pair p taking line ARENA_BOOK_START + p (cyclically).
+        // that book (snek book) instead, pair p taking line ARENA_BOOK_START + p (cyclically);
+        // ARENA_TIME_A=<seconds>: engine A thinks that long per move instead (time odds).
         int pairs = argc > 2 ? std::atoi(argv[2]) : 10;
         double secs = argc > 3 ? std::atof(argv[3]) : 1;
         int threads = argc > 4 ? std::atoi(argv[4]) : 8;
@@ -736,6 +737,7 @@ int main(int argc, char** argv) {
         std::vector<std::vector<Move>> book;
         if (const char* b = getenv("ARENA_BOOK")) book = readBook(b);
         int bookStart = envInt("ARENA_BOOK_START", 0);
+        double secsA = getenv("ARENA_TIME_A") ? std::atof(getenv("ARENA_TIME_A")) : secs;  // time odds: engine A's seconds per move
         Solver solver(22);
         Rng rng(seed);
         int winA = 0, winB = 0, draws = 0;
@@ -758,7 +760,7 @@ int main(int argc, char** argv) {
                 Pos s = open;
                 std::string rec = openRec;
                 while (!s.over()) {
-                    Analysis a = analyze(s, secs, threads, solver, e[s.stm]);
+                    Analysis a = analyze(s, e[s.stm] == A ? secsA : secs, threads, solver, e[s.stm]);
                     rec += moveStr(a.items[0].mv) + " ";
                     s.play(a.items[0].mv);
                 }

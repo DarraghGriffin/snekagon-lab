@@ -52,7 +52,8 @@ struct AbEntry {
 
 // How the "nn" engine evaluates positions (move ordering and leaves alike): by the network alone, or
 // by the mean of the network and the logistic evaluation (the default: the network alone is about
-// twice as fast but loses to ab2, the mean beats it; see README). NN_EVAL=network|mean overrides it.
+// twice as fast but loses to ab2, the mean beats it; see README; leaves far below the window keep the
+// network's value, AbSearcher::leafValue). NN_EVAL=network|mean overrides it.
 enum class NnEval { Network, Mean };
 inline NnEval nnEvalMode() {
     const char* v = getenv("NN_EVAL");
@@ -135,6 +136,19 @@ struct AbSearcher {
         int ub[2];  // the logistic evaluation's bounds are inputs of the network too
         int lv = evaluateBounds(c, ub);
         return (netChild(s, m, c, ub) + lv) / 2;
+    }
+    // A leaf's value for the mean evaluation, lazily: when the network alone puts the child more
+    // than LAZY_MARGIN below the parent's alpha, the mean can only reach alpha if the logistic evaluation
+    // disagrees with it by more than twice that, so the network's value stands and the logistic
+    // evaluation is skipped.
+    static constexpr int LAZY_MARGIN = 100;
+    int leafValue(const Pos& s, Move m, int alpha) {
+        if (!net || mode != NnEval::Mean) return childValue(s, m);
+        Pos c = s; c.play(m);
+        if (c.over()) return terminalScore(c);
+        int vn = netChild(s, m, c);
+        if (-vn <= alpha - LAZY_MARGIN) return vn;
+        return (vn + evaluate(c)) / 2;
     }
     // The evaluation of a position from scratch (the root moves).
     int rootEval(const Pos& c) {
@@ -247,7 +261,7 @@ struct AbSearcher {
                 // the children are leaves: the network's values come straight from the parent's accumulator
                 nodes++;
                 if (checkAbort()) return 0;
-                v = -childValue(s, m);
+                v = -leafValue(s, m, alpha);
             } else {
                 Pos c = s; c.play(m);
                 if (k == 0) v = -abChild(s, m, c, depth - 1, -beta, -alpha);
