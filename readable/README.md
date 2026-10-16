@@ -155,6 +155,13 @@ The one-player optimum and the guaranteed growth bounds were ported later. For t
 6 12 (1 thread) were compared again: identical. With them, `BENCH_WINTEST=1` on `ply5_blue_wins.txt`
 takes 3 846 827 nodes, and `BENCH_PNS=1` 3 132 602.
 
+The sweep's shared table (`makeSweepTable`), the per-position reset (`Solver::newPosition`, also before
+every root move of `parallelSolve`) and the table's key check were ported later too. Compared again:
+`BENCH_FRESH=1 benchset` (exact values, 1 thread) on `ply5_blue_wins.txt` and on 22 units of
+`results/hold_4C26_4A58_refute.log` (every 50th), and the pass-2 proof of
+`REFUTE_LOSS=1 REFUTE_SEARCH=0 refute 1 <log> 1:60 4B:16,27,28,39 4A:55,56,67,78` with
+`REFUTE_FIRST` holding `4C:92,103,112,113` (15 234 447 nodes in both): identical.
+
 With several threads the order of the work depends on timing, so those runs were compared by their
 results: `solvepos` with 4 threads (exact, and `SOLVER_WIN_TEST=1` at ply 5), `refute 2` (the same
 verdict for every move) and `benchset` with 4 threads (the same values). The engine search that picks

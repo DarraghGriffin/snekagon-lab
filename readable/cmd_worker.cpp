@@ -12,6 +12,8 @@
 // With env SOLVER_WIN_TEST=1 the worker only asks whether the side to move wins (cheaper): a unit
 // that is not a win comes back as 0 (draw or loss) or -1 (proven loss) instead of its exact value.
 // A worker that loses the connection reconnects; the coordinator re-queues its units.
+// The threads share one transposition table, kept from unit to unit (makeSweepTable); the rest of a
+// solver's state is reset for every unit (Solver::newPosition).
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -128,6 +130,7 @@ static bool solveUnit(const Unit& unit, Solver& solver, bool winTest, std::strin
         resultLine = line;
         return false;
     }
+    solver.newPosition();
     auto start = std::chrono::steady_clock::now();
     int value = solver.solve(pos, 0, nodeBudget ? nodeBudget : UINT64_MAX, winTest ? 0 : -1, 1);  // -9: budget exceeded
     double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -157,9 +160,10 @@ static int runWorker(const std::string& hostAndPort, int threads, const std::str
 
     // solver threads: take a unit, solve it, send the result
     std::vector<std::thread> solvers;
+    std::shared_ptr<TranspositionTable> table = makeSweepTable();  // the units are usually siblings
     for (int w = 0; w < threads; w++)
         solvers.emplace_back([&] {
-            Solver solver(22);
+            Solver solver(table);
             bool winTest = envInt("SOLVER_WIN_TEST", 0) != 0;
             for (;;) {
                 Unit unit;

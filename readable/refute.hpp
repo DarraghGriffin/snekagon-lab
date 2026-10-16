@@ -20,6 +20,9 @@
 // rest by the evaluation. Moves passed as `first` (answers that won in sibling positions: the same
 // move often wins against many defender replies) are settled by pass 2 before all others.
 //
+// Every solve of the sweep, in both passes and all threads, uses one transposition table
+// (makeSweepTable, SOLVER_SWEEP_TT): the units are siblings and share much of their trees.
+//
 // The log is appended to and read back on a restart (resume). Every refutation in it is one
 // position anyone can solve again:
 //   <move> refuted <reply> <nodes> <seconds>     (pass 2 logs no nodes and seconds)
@@ -111,11 +114,11 @@ class RefutationSweep {
 
   private:
     static constexpr int SEARCH_FAVOURITES = 8;      // the engine search's best moves go first
-    static constexpr int TABLE_LOG2 = 22;            // the solvers' transposition tables
     static constexpr double NO_TIME_LIMIT = 1e9;     // pass 2 runs until the move is settled
 
     Position root;
     int threads;
+    std::shared_ptr<TranspositionTable> table = makeSweepTable();  // for every solve of the sweep
     std::map<std::string, std::string> status;  // attacker move -> "refuted", "open", "wins" or "holds"
     std::map<int, int> refutations;             // defender reply (placement id) -> attacker moves it refuted
     std::vector<Move> bestFirst;                // all attacker moves, in the order they are settled
@@ -171,7 +174,7 @@ class RefutationSweep {
         std::vector<std::thread> pool;
         for (int w = 0; w < threads; w++)
             pool.emplace_back([&] {
-                Solver solver(TABLE_LOG2);
+                Solver solver(table);
                 for (;;) {
                     size_t k = next++;
                     if (k >= to) break;
@@ -220,7 +223,7 @@ class RefutationSweep {
         for (int t = 0; t < maxTries && t < (int)order.size(); t++) {
             Position afterReply = afterMove;
             afterReply.play(order[t].second);
-            solver.clear();
+            solver.newPosition();
             auto start = std::chrono::steady_clock::now();
             // does the attacker win (avoid losing, with REFUTE_LOSS) after this reply?
             int value = mustLose ? solver.solve(afterReply, 0, nodeBudget, -1, 0) : solver.solve(afterReply, 0, nodeBudget, 0, 1);
@@ -246,8 +249,8 @@ class RefutationSweep {
             Position afterMove = root;
             afterMove.play(m);
             // does the defender lose (or, with REFUTE_LOSS, fail to win)?
-            RootSolveResult r = parallelSolve(afterMove, NO_TIME_LIMIT, threads, TABLE_LOG2, {}, nullptr,
-                                              mustLose ? SolveQuestion::WIN_TEST : SolveQuestion::LOSS_TEST);
+            RootSolveResult r = parallelSolve(afterMove, NO_TIME_LIMIT, threads, SOLVER_TABLE_LOG2, {}, nullptr,
+                                              mustLose ? SolveQuestion::WIN_TEST : SolveQuestion::LOSS_TEST, table);
             int refuting = mustLose ? 1 : 0;  // a defender reply this good refutes the move
             if (r.value != Solver::UNKNOWN && r.value < refuting) {
                 status[move] = survives();
@@ -261,7 +264,7 @@ class RefutationSweep {
                     break;
                 }
             fflush(log);
-            printf("pass 2: %s %s\n", move.c_str(), statusOf(move).c_str());
+            printf("pass 2: %s %s (%llu nodes, %.1f s)\n", move.c_str(), statusOf(move).c_str(), (unsigned long long)r.nodes, r.seconds);
             fflush(stdout);
         }
     }

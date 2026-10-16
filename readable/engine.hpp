@@ -498,7 +498,7 @@ inline double proofProgress(const Position& root, Move m, const TranspositionTab
         total++;
         int symmetry;
         TTEntry e;
-        if (after.isOver() ? gameResult(after) > 0 : table.probe(after.canonicalKey(symmetry), e) && e.lower >= 1) proven++;
+        if (after.isOver() ? gameResult(after) > 0 : table.probe(after.canonicalKey(symmetry), after.keyCheck(), e) && e.lower >= 1) proven++;
     });
     return total ? (double)proven / total : 0;
 }

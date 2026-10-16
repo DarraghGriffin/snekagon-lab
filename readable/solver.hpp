@@ -372,11 +372,18 @@ class Solver {
     explicit Solver(int log2Entries = 22) : table(std::make_shared<TranspositionTable>(log2Entries - 1)) { init(); }
     explicit Solver(std::shared_ptr<TranspositionTable> shared) : table(std::move(shared)) { init(); }
 
+    // Forget what belongs to the last position solved and keep the table: before each position of a
+    // run. Killer moves carried over from another position are tried first and cost 13-28% more nodes;
+    // the one-player memo's answers depend on the order of its queries, so a fresh one keeps the node
+    // counts of a position independent of the positions before it (on its own table).
+    void newPosition() {
+        onePlayer.clear();
+        std::memset(killers, -1, sizeof killers);
+    }
     // Forget everything learned (table, killers, one-player answers).
     void clear() {
         table->clear();
-        onePlayer.clear();
-        std::memset(killers, -1, sizeof killers);
+        newPosition();
     }
 
     const OnePlayerOptimum::Statistics& onePlayerStatistics() const { return onePlayer.stats; }
@@ -504,10 +511,11 @@ class Solver {
         int lower = -1, upper = 1;
         int symmetry;
         uint64_t key = pos.canonicalKey(symmetry);
+        uint32_t keyCheck = pos.keyCheck();
         TTEntry stored{-1, 1, -1};
         int tableMove = -1;  // the stored best move, in this position's orientation
         bool known;
-        timed(STEP_TABLE, profilePly, [&] { known = table->probe(key, stored); });
+        timed(STEP_TABLE, profilePly, [&] { known = table->probe(key, keyCheck, stored); });
         if (known) {
             lower = stored.lower;
             upper = stored.upper;
@@ -523,7 +531,7 @@ class Solver {
             timed(STEP_LAST_PIECES, profilePly, [&] { decided = lastPiecesValue(pos, value); });
             if (decided) {
                 profile.lastPieces[profilePly]++;
-                table->store(key, value, value, stored.bestMove, 0);
+                table->store(key, keyCheck, value, value, stored.bestMove, 0);
                 return value;
             }
         }
@@ -549,7 +557,7 @@ class Solver {
             });
             if (lower >= upper || lower >= beta || upper <= alpha) {
                 profile.tightCut[profilePly]++;
-                table->store(key, lower, upper, stored.bestMove, 0);
+                table->store(key, keyCheck, lower, upper, stored.bestMove, 0);
                 return lower >= upper || lower >= beta ? lower : upper;
             }
         }
@@ -680,7 +688,7 @@ class Solver {
         uint64_t work = nodes - nodesAtStart + 1;
         int workLog2 = 63 - __builtin_clzll(work);
         int canonicalBest = bestMove >= 0 ? pieceTables.symmetricPlacement[bestMove][symmetry] : stored.bestMove;
-        table->store(key, newLower, newUpper, canonicalBest, workLog2);
+        table->store(key, keyCheck, newLower, newUpper, canonicalBest, workLog2);
         return best;
     }
 
@@ -771,10 +779,10 @@ class Solver {
             } else {
                 int childSymmetry;
                 TTEntry e;
-                if (table->probe(child.canonicalKey(childSymmetry), e)) value = -e.upper;  // our value >= -upper
+                if (table->probe(child.canonicalKey(childSymmetry), child.keyCheck(), e)) value = -e.upper;  // our value >= -upper
             }
             if (value >= beta) {
-                table->store(key, std::max(lower, value), upper, pieceTables.symmetricPlacement[moves[i].placementId][symmetry], 0);
+                table->store(key, pos.keyCheck(), std::max(lower, value), upper, pieceTables.symmetricPlacement[moves[i].placementId][symmetry], 0);
                 cutoffValue = value;
                 return true;
             }

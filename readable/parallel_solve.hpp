@@ -1,6 +1,7 @@
 // Parallel exact solve of one position: the root moves (symmetric duplicates removed, most
 // promising first by the learned evaluation) are handed out to threads, each with its own
-// solver. Stops as soon as one move settles the question.
+// solver, which forgets its killer moves before every root move (killers from a sibling root
+// move cost about 7% more nodes). Stops as soon as one move settles the question.
 #pragma once
 #include <functional>
 #include <mutex>
@@ -26,12 +27,18 @@ struct RootSolveResult {
 
 using RootMoveCallback = std::function<void(Move, int value, uint64_t nodes, double seconds)>;
 
+// The default size of a thread's own transposition table (log2 of its entries).
+constexpr int SOLVER_TABLE_LOG2 = 22;
+
 // known: root moves already solved earlier (e.g. by an interrupted run) - they are skipped.
 // onResult: called (under a lock) for every newly solved root move.
-// Environment SOLVER_SHARED=<log2 entries>: all threads share one transposition table.
-inline RootSolveResult parallelSolve(const Position& root, double seconds, int threads, int tableLog2 = 22,
+// table: one transposition table for all threads (a sweep's, kept across calls). Without it, the
+// environment SOLVER_SHARED=<log2 entries> gives the threads one table, otherwise each thread has its
+// own of 2^tableLog2 entries.
+inline RootSolveResult parallelSolve(const Position& root, double seconds, int threads, int tableLog2 = SOLVER_TABLE_LOG2,
                                      const std::vector<std::pair<Move, int>>& known = {},
-                                     RootMoveCallback onResult = nullptr, SolveQuestion question = SolveQuestion::EXACT) {
+                                     RootMoveCallback onResult = nullptr, SolveQuestion question = SolveQuestion::EXACT,
+                                     std::shared_ptr<TranspositionTable> table = nullptr) {
     auto startTime = std::chrono::steady_clock::now();
     auto elapsed = [&](std::chrono::steady_clock::time_point since) {
         return std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
@@ -81,7 +88,9 @@ inline RootSolveResult parallelSolve(const Position& root, double seconds, int t
     std::mutex resultLock;
     threads = std::max(1, std::min<int>(threads, (int)moves.size()));
     int sharedLog2 = envInt("SOLVER_SHARED", 0);
-    std::shared_ptr<TranspositionTable> sharedTable = sharedLog2 ? std::make_shared<TranspositionTable>(sharedLog2 - 1) : nullptr;
+    std::shared_ptr<TranspositionTable> sharedTable = table        ? table
+                                                      : sharedLog2 ? std::make_shared<TranspositionTable>(sharedLog2 - 1)
+                                                                   : nullptr;
 
     auto worker = [&] {
         std::unique_ptr<Solver> solver(sharedTable ? new Solver(sharedTable) : new Solver(tableLog2));
@@ -93,6 +102,7 @@ inline RootSolveResult parallelSolve(const Position& root, double seconds, int t
             if (value[i] != Solver::UNKNOWN) continue;  // known from a previous run
             Position child = root;
             child.play(moves[i]);
+            solver->newPosition();
             auto moveStart = std::chrono::steady_clock::now();
             double timeLeft = seconds - elapsed(startTime);
             if (timeLeft <= 0) break;
