@@ -90,13 +90,14 @@ static Analysis analyzeMcts(const Pos& s, double seconds, int threads, Solver& s
     return a;
 }
 
-// version 1 = "ab", 2 = "ab2" (exact root verdicts of its own instead of solveAllRoot)
-static Analysis analyzeAb(const Pos& s, double seconds, int threads, Solver& solver, int multipv, int version) {
+// "ab" (rootSolve: solveAllRoot first), "ab2" and "nn" (exact root verdicts of their own instead)
+static Analysis analyzeAb(const Pos& s, double seconds, int threads, Solver& solver, int multipv, AbEngine& E, bool rootSolve,
+                          const std::string& name) {
     Analysis a;
     auto t0 = std::chrono::steady_clock::now();
-    if (version == 1 && solveAllRoot(s, seconds * 0.3, solver, a)) return a;
+    if (rootSolve && solveAllRoot(s, seconds * 0.3, solver, a)) return a;
     double left = seconds - std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    AbAnalysis r = abAnalyze(s, std::max(0.05, left), threads, multipv, 64, abEngine(version));
+    AbAnalysis r = abAnalyze(s, std::max(0.05, left), threads, multipv, 64, E);
     for (auto& m : r.moves) {
         int ex = -9;
         if (m.verdict == Verdict::Win) ex = 1;
@@ -107,13 +108,14 @@ static Analysis analyzeAb(const Pos& s, double seconds, int threads, Solver& sol
         a.items.push_back({m.mv, m.exact ? 1 : 0, scoreToWinProb(m.exact ? m.display : m.score), ex, m.score});
     }
     a.depth = r.depth;
-    a.engine = version == 2 ? "ab2" : "ab";
+    a.engine = name;
     return a;
 }
 
 static std::string g_engine = "ab2";
 static Analysis analyze(const Pos& s, double seconds, int threads, Solver& solver, const std::string& engine = g_engine, int multipv = 1) {
     if (engine == "mcts") return analyzeMcts(s, seconds, threads, solver);
+    if (isNnEngine(engine)) return analyzeAb(s, seconds, threads, solver, multipv, nnEngine(engine), false, "nn");
     g_handEval = engine == "abhand";
     g_evalSet = 0;
     if (engine.rfind("ab:", 0) == 0) {  // "ab:<weights file>" uses runtime-loaded weights
@@ -124,7 +126,8 @@ static Analysis analyze(const Pos& s, double seconds, int threads, Solver& solve
         }
         g_evalSet = 1;
     }
-    Analysis a = analyzeAb(s, seconds, threads, solver, multipv, engine == "ab2" ? 2 : 1);
+    int version = engine == "ab2" ? 2 : 1;
+    Analysis a = analyzeAb(s, seconds, threads, solver, multipv, abEngine(version), version == 1, version == 2 ? "ab2" : "ab");
     g_handEval = false;
     g_evalSet = 0;
     return a;
@@ -245,7 +248,7 @@ public:
         } else if (cmd == "engine") {
             std::string e;
             in >> e;
-            if (e == "ab" || e == "ab2" || e == "mcts") g_engine = e;
+            if (e == "ab" || e == "ab2" || e == "mcts" || e == "nn") g_engine = e;
             out = "{\"ok\":true,\"engine\":\"" + g_engine + "\"}";
         } else if (cmd == "quit") {
             return "";

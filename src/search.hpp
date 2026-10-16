@@ -10,11 +10,13 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include "core.hpp"
 #include "eval.hpp"
+#include "nn.hpp"
 #include "solver.hpp"
 
 constexpr int WIN = 100000;
@@ -48,6 +50,19 @@ struct AbEntry {
     int16_t best;
 };
 
+// How the "nn" engine scores the leaves of its search (the network always orders the moves): by the
+// logistic evaluation, by the network, or by the mean of the two. NN_LEAVES=logistic|network|mean
+// overrides the engine's choice.
+enum class NnLeaves { Logistic, Network, Mean };
+inline NnLeaves nnLeaves(NnLeaves def) {
+    const char* v = getenv("NN_LEAVES");
+    if (!v) return def;
+    std::string s = v;
+    return s == "logistic" ? NnLeaves::Logistic : s == "network" ? NnLeaves::Network : s == "mean" ? NnLeaves::Mean : def;
+}
+
+constexpr NnLeaves NN_DEFAULT_LEAVES = NnLeaves::Mean;
+
 inline int terminalScore(const Pos& s) {
     int d = s.L[s.stm] - s.L[s.stm ^ 1];
     return d > 0 ? WIN + 100 * d : d < 0 ? -WIN + 100 * d : 0;
@@ -64,6 +79,13 @@ struct AbSearcher {
     std::atomic<bool>* stop = nullptr;
     std::chrono::steady_clock::time_point deadline;
     bool aborted = false;
+    // The network (the "nn" engine): the accumulators of the positions on the current search path,
+    // each updated from its parent's.
+    const nn::Net* net = nullptr;
+    NnLeaves leaves = NnLeaves::Network;
+    struct NnLevel { nn::Planes P; nn::Accumulator A; };
+    std::vector<NnLevel> nnPath = std::vector<NnLevel>(64);
+    int lvl = 0;
 
     explicit AbSearcher(const AbParams& params, int log2 = 19) : P(params), solver(19) {
         tt.assign(size_t(1) << log2, AbEntry{0, 0, -1, 0, -1});
@@ -78,6 +100,60 @@ struct AbSearcher {
             if ((stop && stop->load(std::memory_order_relaxed)) || std::chrono::steady_clock::now() > deadline) aborted = true;
         }
         return aborted;
+    }
+
+    // Search from a root position (resets the network's path to it).
+    int searchRoot(const Pos& s, int depth, int alpha, int beta) {
+        if (net) {
+            lvl = 0;
+            nn::planesOf(s, nnPath[0].P);
+            net->refresh(nnPath[0].P, nnPath[0].A);
+        }
+        return ab(s, depth, alpha, beta);
+    }
+    // The leaf evaluation of s, the position at the current level of the path.
+    int staticEval(const Pos& s) {
+        if (!net || leaves == NnLeaves::Logistic) return evaluate(s);
+        int v = net->evaluate(nnPath[lvl].A, s.stm, s.ply);
+        return leaves == NnLeaves::Mean ? (v + evaluate(s)) / 2 : v;
+    }
+    // The network's value of c = s after m (legal in s, the current level) for c's side to move,
+    // from s's accumulator.
+    int netChild(const Pos& s, Move m, const Pos& c) {
+        const NnLevel& L = nnPath[lvl];
+        nn::Planes Q;
+        nn::planesAfter(s, L.P, m.pl(), m.piece(), c, Q);
+        nn::Delta d;
+        nn::deltaOf(L.P, Q, d);
+        nn::Accumulator A;
+        net->apply(L.A, d, A);
+        return net->evaluate(A, c.stm, c.ply);
+    }
+    // The value of c = s after m for c's side to move, as the move ordering (order) or the leaves
+    // (!order) score it.
+    int childValue(const Pos& s, Move m, bool order) {
+        Pos c = s; c.play(m);
+        if (c.over()) return terminalScore(c);
+        if (!net) return evaluate(c);
+        if (order || leaves == NnLeaves::Network) return netChild(s, m, c);
+        return leaves == NnLeaves::Mean ? (netChild(s, m, c) + evaluate(c)) / 2 : evaluate(c);
+    }
+    // ab() of the child c = s after m, with the network path extended to it.
+    int abChild(const Pos& s, Move m, const Pos& c, int depth, int alpha, int beta) {
+        if (net) {
+            NnLevel& L = nnPath[lvl], &N = nnPath[lvl + 1];
+            if (m.isPass()) N.P = L.P, N.A = L.A;
+            else {
+                nn::planesAfter(s, L.P, m.pl(), m.piece(), c, N.P);
+                nn::Delta d;
+                nn::deltaOf(L.P, N.P, d);
+                net->apply(L.A, d, N.A);
+            }
+        }
+        lvl++;
+        int v = ab(c, depth, alpha, beta);
+        lvl--;
+        return v;
     }
 
     // exact knowledge from bounds / small endgames; returns true and sets v if known
@@ -100,7 +176,7 @@ struct AbSearcher {
         nodes++;
         if (checkAbort()) return 0;
         if (s.over()) return terminalScore(s);
-        if (depth <= 0) return evaluate(s);
+        if (depth <= 0) return staticEval(s);
 
         int t;
         uint64_t key = s.key(t);
@@ -121,7 +197,7 @@ struct AbSearcher {
         s.genMoves(mv);
         if (mv.empty()) {
             Pos c = s; c.play(Move{});
-            return -ab(c, depth, -beta, -alpha);  // a pass does not use up depth
+            return -abChild(s, Move{}, c, depth, -beta, -alpha);  // a pass does not use up depth
         }
         int n = (int)mv.size();
         std::vector<int> sc(n);
@@ -131,8 +207,8 @@ struct AbSearcher {
             // order by 1-ply evaluation, keep the best `width`
             for (int i = 0; i < n; i++) {
                 if ((++nodes & 63) == 0 && checkAbort()) return 0;
-                Pos c = s; c.play(mv[i]);
-                sc[i] = c.over() ? -terminalScore(c) : -evaluate(c);
+                if (net) sc[i] = -childValue(s, mv[i], true);
+                else { Pos c = s; c.play(mv[i]); sc[i] = c.over() ? -terminalScore(c) : -evaluate(c); }
                 if (mv[i].gid == ttMove) sc[i] += 10 * WIN;
                 else if (mv[i].gid == killer[ply][0] || mv[i].gid == killer[ply][1]) sc[i] += 200;
             }
@@ -162,12 +238,19 @@ struct AbSearcher {
         for (int k = 0; k < n; k++) {
             if (k >= limit && best > -WIN / 2) break;
             Move m = mv[idx[k]];
-            Pos c = s; c.play(m);
             int v;
-            if (k == 0) v = -ab(c, depth - 1, -beta, -alpha);
-            else {
-                v = -ab(c, depth - 1, -alpha - 1, -alpha);
-                if (v > alpha && v < beta) v = -ab(c, depth - 1, -beta, -alpha);
+            if (net && depth == 1) {
+                // the children are leaves: the network's values come straight from the parent's accumulator
+                nodes++;
+                if (checkAbort()) return 0;
+                v = -childValue(s, m, false);
+            } else {
+                Pos c = s; c.play(m);
+                if (k == 0) v = -abChild(s, m, c, depth - 1, -beta, -alpha);
+                else {
+                    v = -abChild(s, m, c, depth - 1, -alpha - 1, -alpha);
+                    if (v > alpha && v < beta) v = -abChild(s, m, c, depth - 1, -beta, -alpha);
+                }
             }
             if (aborted) return 0;
             if (v > best) { best = v; bestGid = m.gid; }
@@ -230,6 +313,8 @@ inline double scoreToWinProb(int score) {
 // subtrees of earlier ones, so proofs carry over).
 struct AbEngine {
     AbParams P;
+    const nn::Net* net = nullptr;  // the network ("nn" engine): move ordering, and leaves as `leaves` says
+    NnLeaves leaves = NnLeaves::Network;
     std::vector<std::unique_ptr<AbSearcher>> pool;
     std::shared_ptr<LTT> exactTT;
     std::vector<std::unique_ptr<Solver>> exactPool;
@@ -238,6 +323,23 @@ struct AbEngine {
 inline AbEngine& abEngine(int version) {
     static AbEngine v1{AbParams{}}, v2{abParamsV2()};
     return version == 2 ? v2 : v1;
+}
+
+// The network file named by an engine name: "nn" (the compiled-in network) or "nn:<file>".
+inline bool isNnEngine(const std::string& name) { return name == "nn" || name.rfind("nn:", 0) == 0; }
+inline std::string nnPath(const std::string& name) { return name.size() > 3 ? name.substr(3) : ""; }
+// The "nn" engine: ab2 with the network evaluation; one instance (state kept between moves) per network.
+inline AbEngine& nnEngine(const std::string& name) {
+    static std::mutex mu;
+    static std::map<std::string, std::unique_ptr<AbEngine>> engines;
+    std::lock_guard<std::mutex> lk(mu);
+    auto& e = engines[name];
+    if (!e) {
+        e = std::make_unique<AbEngine>(abParamsV2());
+        e->net = nn::loadNet(nnPath(name));
+        e->leaves = nnLeaves(NN_DEFAULT_LEAVES);
+    }
+    return *e;
 }
 
 // Value of s for the side to move from the exact solver with window (alpha, beta), or -9 if the
@@ -396,7 +498,7 @@ inline std::vector<RootResult> rootMovesByEval(const Pos& root, AbSearcher& S) {
         int v;
         if (c.over()) v = -terminalScore(c);
         else if (S.exactKnown(c, v)) v = -v;
-        else v = -evaluate(c);
+        else v = S.net ? -S.net->evaluate(c) : -evaluate(c);
         cur[i].mv = mv[i]; cur[i].score = v; cur[i].exact = true; cur[i].depth = 1; cur[i].display = v;
     }
     std::stable_sort(cur.begin(), cur.end(), [](auto& a, auto& b) { return a.score > b.score; });
@@ -412,6 +514,7 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
     std::atomic<bool> stop{false};
     auto& pool = E.pool;  // reused between calls (TT warm)
     while ((int)pool.size() < threads) pool.emplace_back(new AbSearcher(P));
+    for (auto& S : pool) S->net = E.net, S->leaves = E.leaves;
 
     AbAnalysis res;
     res.moves = rootMovesByEval(root, *pool[0]);
@@ -458,10 +561,10 @@ inline AbAnalysis abAnalyze(const Pos& root, double seconds, int threads, int mu
             Pos c = root; c.play(next[i].mv);
             int a = threshold();
             int v;
-            if (a == -INF) v = -S.ab(c, depth - 1, -INF, INF);
+            if (a == -INF) v = -S.searchRoot(c, depth - 1, -INF, INF);
             else {
-                v = -S.ab(c, depth - 1, -a - 1, -a);
-                if (!S.aborted && v > a) v = -S.ab(c, depth - 1, -INF, -a);
+                v = -S.searchRoot(c, depth - 1, -a - 1, -a);
+                if (!S.aborted && v > a) v = -S.searchRoot(c, depth - 1, -INF, -a);
             }
             if (S.aborted) return;
             std::lock_guard<std::mutex> lk(mu);

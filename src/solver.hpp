@@ -12,6 +12,7 @@
 #include <memory>
 #include "core.hpp"
 #include "eval.hpp"
+#include "nn.hpp"
 
 // Lockless 2-way transposition table. Each slot stores key^data and data, so an entry
 // torn by concurrent writes fails the key check instead of returning garbage.
@@ -89,6 +90,10 @@ struct Solver {
     int tightAllNodeRem = envInt("SOLVER_TIGHT_ALL_REM", ALL_NODE_TIGHT_BOUNDS_MAX_PIECES);  // ... and at all-nodes up to this
     OnePlayer onePlayer;
     uint64_t pTight[16] = {};  // nodes cut by the tight bounds, per ply
+    // SOLVER_NN=<file>: order children by that network instead of the logistic evaluation (values are
+    // the same either way; only the node counts change)
+    const nn::Net* orderNet = getenv("SOLVER_NN") ? nn::loadNet(getenv("SOLVER_NN")) : nullptr;
+    double orderLogit(const Pos& c) const { return orderNet ? orderNet->evaluate(c) / 100.0 : learnedLogit(c); }
 
     // log2size: log2 of the number of entries (16 bytes each)
     explicit Solver(int log2size = 22) : tt(std::make_shared<LTT>(log2size - 1)) { init(); }
@@ -511,7 +516,7 @@ struct Solver {
             for (int i = from; i < n; i++)
                 if (score[i] < ahead) {
                     Pos c = s; c.play(moves[i]);
-                    score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * learnedLogit(c));
+                    score[i] = c.over() ? -terminalValue(c) * 100000 : -(int)(1000 * orderLogit(c));
                 }
         };
         if (doEval || doEtc) {

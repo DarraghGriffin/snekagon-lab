@@ -26,6 +26,8 @@
 #include "serve.hpp"
 #include "refute.hpp"
 #include "worker.hpp"
+#include "datagen.hpp"
+#include "nn.hpp"
 
 static uint64_t perft(const Pos& s, int d) {
     if (d == 0 || s.over()) return 1;
@@ -112,42 +114,9 @@ static int oneHandedBest(const Pos& s, int c, uint64_t& budget) {
 }
 
 // ---- training data rows ----------------------------------------------------------
-static std::string hex128(BB b) {
-    char buf[40];
-    snprintf(buf, sizeof buf, "%016llx%016llx", (unsigned long long)(uint64_t)(b >> 64), (unsigned long long)(uint64_t)b);
-    return buf;
-}
-static BB parseHex128(const std::string& h) {
-    BB r = 0;
-    for (char c : h) r = r * 16 + (BB)(c >= '0' && c <= '9' ? c - '0' : c - 'a' + 10);
-    return r;
-}
-// own0_own1_avail0_avail1_stm_ply_passes
-static std::string posStr(const Pos& s);
 // First line of a refute log: the position, the question (REFUTE_LOSS) and SOLVER_RED_BONUS.
 static std::string refuteHeader(const Pos& s) {
     return "# refute " + posStr(s) + " loss " + std::to_string(envInt("REFUTE_LOSS", 0) != 0) + " bonus " + std::to_string(RED_BONUS);
-}
-static std::string posStr(const Pos& s) {
-    return hex128(s.own[0]) + "_" + hex128(s.own[1]) + "_" + std::to_string(s.avail[0]) + "_" + std::to_string(s.avail[1]) +
-           "_" + std::to_string(s.stm) + "_" + std::to_string(s.ply) + "_" + std::to_string(s.passes);
-}
-static bool parsePosStr(const std::string& str, Pos& s) {
-    std::vector<std::string> f;
-    size_t i = 0;
-    while (i <= str.size()) {
-        size_t j = str.find('_', i);
-        if (j == std::string::npos) j = str.size();
-        f.push_back(str.substr(i, j - i));
-        i = j + 1;
-    }
-    if (f.size() != 7) return false;
-    s = Pos{};
-    s.own[0] = parseHex128(f[0]); s.own[1] = parseHex128(f[1]);
-    s.avail[0] = (uint8_t)std::stoi(f[2]); s.avail[1] = (uint8_t)std::stoi(f[3]);
-    s.stm = (uint8_t)std::stoi(f[4]); s.ply = (uint8_t)std::stoi(f[5]); s.passes = (uint8_t)std::stoi(f[6]);
-    s.initHash();
-    return true;
 }
 static void printDataHeader() {
     printf("game,ply,stm,value");
@@ -756,25 +725,33 @@ int main(int argc, char** argv) {
         }
     } else if (mode == "arena") {
         // engine A vs engine B from random openings (random 1-hex + random reply),
-        // every opening played twice with colours swapped.
+        // every opening played twice with colours swapped. ARENA_BOOK=<file>: the openings of
+        // that book (snek book) instead, pair p taking line ARENA_BOOK_START + p (cyclically).
         int pairs = argc > 2 ? std::atoi(argv[2]) : 10;
         double secs = argc > 3 ? std::atof(argv[3]) : 1;
         int threads = argc > 4 ? std::atoi(argv[4]) : 8;
         std::string A = argc > 5 ? argv[5] : "ab2", B = argc > 6 ? argv[6] : "mcts";
         uint64_t seed = argc > 7 ? std::atoll(argv[7]) : 2024;
         int randomPlies = argc > 8 ? std::atoi(argv[8]) : 2;  // random moves at the start of each opening
+        std::vector<std::vector<Move>> book;
+        if (const char* b = getenv("ARENA_BOOK")) book = readBook(b);
+        int bookStart = envInt("ARENA_BOOK_START", 0);
         Solver solver(22);
         Rng rng(seed);
         int winA = 0, winB = 0, draws = 0;
         std::vector<Move> buf;
         for (int p = 0; p < pairs; p++) {
             Pos open = Pos::start();
-            std::string openRec;  // the random opening, so the printed record replays from the start
-            for (int k = 0; k < randomPlies; k++) {
-                open.genMoves(buf);
-                Move m = buf[rng.below((int)buf.size())];
-                openRec += moveStr(m) + " ";
-                open.play(m);
+            std::string openRec;  // the opening, so the printed record replays from the start
+            if (!book.empty()) {
+                for (Move m : book[(bookStart + p) % book.size()]) { openRec += moveStr(m) + " "; open.play(m); }
+            } else {
+                for (int k = 0; k < randomPlies; k++) {
+                    open.genMoves(buf);
+                    Move m = buf[rng.below((int)buf.size())];
+                    openRec += moveStr(m) + " ";
+                    open.play(m);
+                }
             }
             for (int sw = 0; sw < (A == B ? 1 : 2); sw++) {  // identical engines: the swapped game would be the same
                 std::string e[2] = {sw ? B : A, sw ? A : B};
@@ -796,6 +773,187 @@ int main(int argc, char** argv) {
             }
         }
         printf("FINAL %s %d : %s %d  (draws %d)\n", A.c_str(), winA, B.c_str(), winB, draws);
+    } else if (mode == "datagen") {
+        // snek datagen <out.csv> <games> <threads> <seconds/move> <seed> [engine] [book]: self-play
+        // training data (datagen.hpp); engine ab2 (default) or nn[:<net file>]; book: one opening
+        // (a move list) per line, else random 1-hex + random reply
+        if (argc < 7) { fprintf(stderr, "usage: snek datagen <out.csv> <games> <threads> <seconds/move> <seed> [engine] [book]\n"); return 1; }
+        DatagenConfig C;
+        C.games = std::atoi(argv[3]);
+        C.threads = std::atoi(argv[4]);
+        C.seconds = std::atof(argv[5]);
+        C.seed = std::atoll(argv[6]);
+        std::string engine = argc > 7 ? argv[7] : "ab2";
+        if (argc > 8) C.book = readBook(argv[8]);
+        C.randomShare = envInt("DATAGEN_RANDOM_PCT", 12) / 100.0;
+        C.sampleShare = envInt("DATAGEN_SAMPLE_PCT", 30) / 100.0;
+        C.ply5Share = envInt("DATAGEN_PLY5_PCT", 10) / 100.0;
+        C.siblings = envInt("DATAGEN_SIBLINGS", C.siblings);
+        C.searchKids = envInt("DATAGEN_SEARCH_KIDS", C.searchKids);
+        C.leafSamples = envInt("DATAGEN_LEAVES", C.leafSamples);
+        FILE* out = fopen(argv[2], "ab");
+        if (!out) { fprintf(stderr, "cannot open %s\n", argv[2]); return 1; }
+        fseek(out, 0, SEEK_END);
+        if (ftell(out) == 0) printDatagenHeader(out);
+        runDatagen(C, out, [&] { return makeEngine(engine); });
+        fclose(out);
+    } else if (mode == "evalrank" || mode == "firstwin") {
+        // snek evalrank <eval> <move> <moves...>: the rank of <move> among the side to move's
+        // (symmetry-unique) moves in the evaluation's order, as proveline and refute order them.
+        // snek firstwin <eval> <data.csv> <ply> <max>: for held-out won positions at <ply> in a datagen
+        // file (games with id hash 0 mod 10, as tools/train_nn.py holds out), the rank of the first
+        // winning move in the evaluation's order (each move solved exactly in that order).
+        // <eval>: "logistic", "nn" (compiled-in network) or "nn:<file>".
+        std::string ev = argv[2];
+        const nn::Net* net = ev == "logistic" ? nullptr : nn::loadNet(nnPath(ev));
+        auto ordered = [&](const Pos& s) {
+            std::vector<std::pair<double, Move>> r;
+            for (Move m : uniqueRootMoves(s)) {
+                Pos c = s; c.play(m);
+                double v = c.over() ? -Solver::terminalValue(c) * 1000.0 : net ? -net->evaluate(c) / 100.0 : -learnedLogit(c);
+                r.push_back({v, m});
+            }
+            std::stable_sort(r.begin(), r.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            return r;
+        };
+        if (mode == "evalrank") {
+            Move target;
+            Pos s = Pos::start();
+            if (!parseMove(argv[3], target)) { fprintf(stderr, "bad move %s\n", argv[3]); return 1; }
+            for (int i = 4; i < argc; i++) { Move m; if (!parseMove(argv[i], m) || !s.legalMove(m)) { fprintf(stderr, "illegal %s\n", argv[i]); return 1; } s.play(m); }
+            Pos tc = s; tc.play(target);
+            int tt; uint64_t tkey = tc.key(tt);
+            auto r = ordered(s);
+            for (size_t i = 0; i < r.size(); i++) {
+                Pos c = s; c.play(r[i].second);
+                int t; if (c.key(t) == tkey) { printf("rank %zu of %zu\n", i + 1, r.size()); return 0; }
+            }
+            printf("not found among %zu moves\n", r.size());
+            return 1;
+        }
+        std::ifstream in(argv[3]);
+        int ply = std::atoi(argv[4]), maxPos = std::atoi(argv[5]);
+        std::string line;
+        std::getline(in, line);
+        Solver S(22);
+        int n = 0, top1 = 0, top5 = 0;
+        double sumRank = 0;
+        printf("rank,moves,nodes\n");
+        while (n < maxPos && std::getline(in, line)) {
+            std::vector<std::string> f;
+            std::stringstream ss(line); std::string c;
+            while (std::getline(ss, c, ',')) f.push_back(c);
+            if (f.size() != 11 || f[0] != "g" || std::atoi(f[2].c_str()) != ply || f[5] != "1") continue;
+            long long game = std::atoll(f[1].c_str());
+            if ((uint64_t)game * 2654435761ULL % (1ULL << 32) % 10 != 0) continue;  // held-out games only
+            Pos s;
+            if (!parsePosStr(f[10], s)) continue;
+            S.clear();
+            auto r = ordered(s);
+            int rank = -1;
+            uint64_t nodes = 0;
+            for (size_t i = 0; i < r.size(); i++) {
+                Pos ch = s; ch.play(r[i].second);
+                int v = ch.over() ? Solver::terminalValue(ch) : S.solve(ch, 0, UINT64_MAX, -1, 0);  // does the opponent lose?
+                nodes += S.nodes;
+                if (v < 0) { rank = (int)i + 1; break; }
+            }
+            printf("%d,%zu,%llu\n", rank, r.size(), (unsigned long long)nodes);
+            n++;
+            top1 += rank == 1; top5 += rank >= 1 && rank <= 5; sumRank += rank;
+        }
+        printf("# %d won positions at ply %d: top-1 %.3f, top-5 %.3f, mean rank %.2f\n", n, ply, (double)top1 / n, (double)top5 / n, sumRank / n);
+    } else if (mode == "book") {
+        // snek book <out> <candidates> <threads> <seconds> <seed> [plies] [lo] [hi]: balanced openings for
+        // arena matches: <plies> random moves (default 3), kept when ab2's win probability for the
+        // side to move after <seconds> of search lies in [lo, hi] (default 0.35-0.65). One opening
+        // (a move list) per line, the score after a #.
+        if (argc < 7) { fprintf(stderr, "usage: snek book <out> <candidates> <threads> <seconds> <seed> [plies] [lo] [hi]\n"); return 1; }
+        int candidates = std::atoi(argv[3]), threads = std::atoi(argv[4]);
+        double secs = std::atof(argv[5]);
+        uint64_t seed = std::atoll(argv[6]);
+        int plies = argc > 7 ? std::atoi(argv[7]) : 3;
+        double lo = argc > 8 ? std::atof(argv[8]) : 0.35, hi = argc > 9 ? std::atof(argv[9]) : 0.65;
+        FILE* out = fopen(argv[2], "a");
+        std::atomic<int> next{0}, kept{0};
+        std::mutex mu;
+        std::vector<std::thread> th;
+        for (int w = 0; w < threads; w++)
+            th.emplace_back([&] {
+                auto E = makeEngine("ab2");
+                std::vector<Move> buf;
+                for (;;) {
+                    int i = next++;
+                    if (i >= candidates) break;
+                    Rng rng(seed * 1000003 + i);
+                    Pos s = Pos::start();
+                    std::string rec;
+                    for (int k = 0; k < plies && !s.over(); k++) {
+                        s.genMoves(buf);
+                        Move m = buf[rng.below((int)buf.size())];
+                        rec += moveStr(m) + " ";
+                        s.play(m);
+                    }
+                    AbAnalysis r = abAnalyze(s, secs, 1, 1, 64, *E);
+                    double w = scoreToWinProb(r.moves[0].score);
+                    if (w < lo || w > hi) continue;
+                    kept++;
+                    std::lock_guard<std::mutex> lk(mu);
+                    fprintf(out, "%s# %d\n", rec.c_str(), r.moves[0].score);
+                    fflush(out);
+                }
+            });
+        for (auto& t : th) t.join();
+        fclose(out);
+        fprintf(stderr, "kept %d of %d openings\n", kept.load(), candidates);
+    } else if (mode == "nnfeatures") {
+        // snek nnfeatures <in.csv> <out.bin>: the network inputs (nn.hpp) of the position in the pos
+        // column of every row, for tools/train_nn.py. Per row: uint16 count + uint16 inputs for the
+        // side to move's perspective, then the same for the opponent's. <out.bin>.sym: the image of
+        // every input under each of the 12 symmetries (int16 [12][inputs]). Each row ends with the
+        // logistic evaluation of the position (float32), for comparison.
+        std::ifstream in(argv[2]);
+        FILE* out = fopen(argv[3], "wb");
+        if (!in || !out) { fprintf(stderr, "cannot open files\n"); return 1; }
+        std::string line;
+        std::getline(in, line);
+        int ip = -1, col = 0;
+        { std::stringstream ss(line); std::string c; while (std::getline(ss, c, ',')) { if (c == "pos") ip = col; col++; } }
+        if (ip < 0) { fprintf(stderr, "no pos column\n"); return 1; }
+        nn::CM.init();
+        long rows = 0, bad = 0;
+        std::vector<uint16_t> buf;
+        while (std::getline(in, line)) {
+            std::stringstream ss(line); std::string c, ps;
+            for (int k = 0; std::getline(ss, c, ','); k++) if (k == ip) ps = c;
+            Pos s;
+            uint16_t zero = 0;
+            float logit = 0;
+            if (ps.empty() || !parsePosStr(ps, s)) {
+                bad++;
+                fwrite(&zero, 2, 1, out); fwrite(&zero, 2, 1, out); fwrite(&logit, 4, 1, out);
+                continue;
+            }
+            nn::Planes P;
+            nn::planesOf(s, P);
+            for (int p : {(int)s.stm, (int)s.stm ^ 1}) {
+                buf.clear();
+                nn::forEachInput(P, p, [&](int i) { buf.push_back((uint16_t)i); });
+                uint16_t n = (uint16_t)buf.size();
+                fwrite(&n, 2, 1, out);
+                fwrite(buf.data(), 2, n, out);
+            }
+            logit = s.over() ? 0.f : (float)learnedLogit(s);  // the logistic evaluation, for comparison
+            fwrite(&logit, 4, 1, out);
+            rows++;
+        }
+        fclose(out);
+        std::vector<int16_t> sym;
+        nn::inputSymmetries(sym);
+        FILE* fs = fopen((std::string(argv[3]) + ".sym").c_str(), "wb");
+        fwrite(sym.data(), 2, sym.size(), fs);
+        fclose(fs);
+        fprintf(stderr, "%ld rows (%ld unreadable, written empty), %d inputs\n", rows, bad, nn::N_INPUTS);
     } else if (mode == "info") {
         for (int p = 0; p < NPIECE; p++) printf("%s: %zu placements\n", PNAME[p], T.PL[p].size());
         printf("total placements %d\n", T.NGID);
