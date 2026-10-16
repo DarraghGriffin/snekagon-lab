@@ -336,34 +336,37 @@ def main():
             net.adam(g, lr, a.wd)
         report(f'epoch {ep + 1}')
     z = report('final')
-    print('test by ply: n, network logloss, logistic logloss, network acc, logistic acc (decisive exact rows)')
+    # "mean": the mean of the network's and the logistic evaluation's logits (the nn engine's evaluation)
+    print('test by ply: n, logloss network / logistic / mean, accuracy network / logistic / mean (decisive exact rows)')
     for p in range(0, a.max_ply + 1):
         m = D.ply[te] == p
         if not m.sum():
             continue
-        yy = D.y[te][m]; zn = z[m]; zl = D.logit[te][m]
+        yy = D.y[te][m]; zn = z[m]; zl = D.logit[te][m]; zm = (zn + zl) / 2
         ex = D.known[te][m] & (yy != 0.5)
         acc = lambda q: ((q[ex] > 0) == (yy[ex] > 0.5)).mean() if ex.sum() else float('nan')
-        print(f'  ply {p:2d} n={m.sum():6d} exact={ex.sum():6d}  {logloss(zn, yy).mean():.4f}  {logloss(zl, yy).mean():.4f}  {acc(zn):.3f}  {acc(zl):.3f}')
+        print(f'  ply {p:2d} n={m.sum():6d} exact={ex.sum():6d}  {logloss(zn, yy).mean():.4f} {logloss(zl, yy).mean():.4f} '
+              f'{logloss(zm, yy).mean():.4f}  {acc(zn):.3f} {acc(zl):.3f} {acc(zm):.3f}')
     # sibling ranking on held-out groups: share of correctly ordered pairs
     tg = [g for g in D.groups if test[g[0]]]
     if tg:
         rr = np.concatenate(tg)
         zr = evaluate(rr)
         lr_ = D.logit[rr]
-        print('held-out sibling pairs by ply (pairs, share ordered like the target: network, logistic):')
+        print('held-out sibling pairs by ply (pairs, share ordered like the target: network, logistic, mean):')
         stats = {}
         at = 0
+        zm_ = (zr + lr_) / 2
         for gg in tg:
             k = len(gg); hi, lo = rank_pairs(D.rt[gg])
-            s = stats.setdefault(int(D.ply[gg[0]]), [0, 0, 0])
+            s = stats.setdefault(int(D.ply[gg[0]]), [0, 0, 0, 0])
             s[0] += len(hi)
-            s[1] += (zr[at:at + k][hi] > zr[at:at + k][lo]).sum()
-            s[2] += (lr_[at:at + k][hi] > lr_[at:at + k][lo]).sum()
+            for j, q in enumerate((zr, lr_, zm_)):
+                s[j + 1] += (q[at:at + k][hi] > q[at:at + k][lo]).sum()
             at += k
         for p in sorted(stats):
-            n_, a_, b_ = stats[p]
-            print(f'  ply {p:2d}: {n_:6d} pairs  {a_ / n_:.3f}  {b_ / n_:.3f}')
+            n_, a_, b_, c_ = stats[p]
+            print(f'  ply {p:2d}: {n_:6d} pairs  {a_ / n_:.3f}  {b_ / n_:.3f}  {c_ / n_:.3f}')
     if a.report_only:
         return
     net.save(a.out)
