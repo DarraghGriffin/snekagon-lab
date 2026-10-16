@@ -72,6 +72,7 @@ struct Orient {
     std::vector<std::pair<int, int>> tri;     // outside cells touching 2 adjacent (or >=3) piece cells
     std::vector<std::pair<int, int>> two;     // outside cells touching exactly 2 non-adjacent piece cells
     int16_t gidAt[NIDX];                      // anchor cell -> placement gid (-1 if off board)
+    BB nextTo[NIDX];                          // cell -> anchors whose placement covers a neighbour of it, not it
 };
 
 struct Tables {
@@ -204,7 +205,7 @@ inline void initTables() {
                             if (hexAdj(o[touching[x]].first, o[touching[x]].second, o[touching[y]].first, o[touching[y]].second)) adjPair = true;
                     (adjPair ? od.tri : od.two).push_back(e);
                 }
-            for (int i = 0; i < NIDX; i++) od.gidAt[i] = -1;
+            for (int i = 0; i < NIDX; i++) { od.gidAt[i] = -1; od.nextTo[i] = 0; }
             for (int c : T.cells) {
                 Placement pl{};
                 bool ok = true;
@@ -218,6 +219,7 @@ inline void initTables() {
                 pl.nb = expand(pl.m) & ~pl.m;
                 pl.gid = (int)T.gidInfo.size();
                 od.gidAt[c] = (int16_t)pl.gid;
+                for (BB nb = pl.nb; nb; nb &= nb - 1) od.nextTo[lsb(nb)] |= bit(c);
                 T.gidInfo.push_back({p, (int)T.PL[p].size()});
                 T.PL[p].push_back(pl);
             }
@@ -295,10 +297,8 @@ struct GenCtx {
     BB me, meDeg1;
 };
 
-inline BB orientLegal(const Orient& o, const GenCtx& g) {
-    BB nw = T.VALID;
-    for (int k = 0; k < o.n; k++) nw &= shiftFrom(g.iso, o.dq[k], o.dr[k]);
-    if (!g.adjOwn) return nw;
+// anchors of the legal placements of orientation o that grow an own snake
+inline BB orientGrowLegal(const Orient& o, const GenCtx& g) {
     BB gr = T.VALID, touch = 0;
     for (int k = 0; k < o.n; k++) {
         gr &= shiftFrom(g.allow[o.ideg[k]], o.dq[k], o.dr[k]);
@@ -309,7 +309,13 @@ inline BB orientLegal(const Orient& o, const GenCtx& g) {
         for (auto [q, r] : o.tri) gr &= ~shiftFrom(g.me, q, r);
         for (auto [q, r] : o.two) gr &= ~shiftFrom(g.meDeg1, q, r);
     }
-    return nw | gr;
+    return gr;
+}
+inline BB orientLegal(const Orient& o, const GenCtx& g) {
+    BB nw = T.VALID;
+    for (int k = 0; k < o.n; k++) nw &= shiftFrom(g.iso, o.dq[k], o.dr[k]);
+    if (!g.adjOwn) return nw;
+    return nw | orientGrowLegal(o, g);
 }
 
 struct Pos {
@@ -410,21 +416,25 @@ struct Pos {
         g.meDeg1 = sh.own & sh.ge1;
     }
     template <class F>
-    void forEachLegal(F&& f) const { forEachLegalImpl<false>(0, f); }
+    void forEachLegal(F&& f) const { forEachLegalImpl<false, false>(0, f); }
     // only the legal placements covering at least one cell of `touch`
     template <class F>
-    void forEachLegalTouching(BB touch, F&& f) const { forEachLegalImpl<true>(touch, f); }
-    template <bool Touching, class F>
+    void forEachLegalTouching(BB touch, F&& f) const { forEachLegalImpl<true, false>(touch, f); }
+    // only the legal placements that grow an own snake
+    template <class F>
+    void forEachLegalGrow(F&& f) const { forEachLegalImpl<false, true>(0, f); }
+    template <bool Touching, bool GrowOnly, class F>
     void forEachLegalImpl(BB touch, F&& f) const {
         uint8_t av = movable();
         if (!av) return;
         GenCtx g;
         genCtx(g);
+        if (GrowOnly && !g.adjOwn) return;
         for (int p = 0; p < NPIECE; p++) {
             if (!(av >> p & 1)) continue;
             for (int o = T.orBegin[p]; o < T.orBegin[p + 1]; o++) {
                 const Orient& od = T.OR[o];
-                BB lg = orientLegal(od, g);
+                BB lg = GrowOnly ? orientGrowLegal(od, g) : orientLegal(od, g);
                 if (Touching && lg) {
                     BB anchors = 0;
                     for (int k = 0; k < od.n; k++) anchors |= shiftFrom(touch, od.dq[k], od.dr[k]);
@@ -618,6 +628,203 @@ inline int lengthAfter(const Pos& s, int c, const Placement& pl) {
         if (s.comp[c][j] & pl.nb) merged += popc(s.comp[c][j]);
     return std::max<int>(s.L[c], merged);
 }
+
+// Exact one-player optimum: could player c make a snake of at least `target` cells if the
+// opponent never moved again? It is a relaxation of the real game, so a "no" is a sound upper
+// bound, and much tighter than clusterBound, because it follows how the fixed piece shapes chain:
+//  - c's future cells are growable cells, and the final snake lies in one cluster (as above);
+//  - the opponent's future cells, the order of c's moves and the rule that a new snake touches
+//    nothing are dropped (each only removes options);
+//  - the final snake is an induced path of whole old snakes and whole new pieces, each new piece
+//    attached at an end of the path built so far.
+// A depth-first search grows the path from a seed: an old snake (merging an old snake with a lower
+// index is skipped, that path is grown from that snake), or for a path of new pieces only, its
+// lowest piece. It extends one end, then the other, with the grow rules of orientLegal narrowed
+// to "touches the end being extended", and stops where the remaining pieces and the snakes they
+// could merge are too short. The last piece goes to either end in one step. Answers are memoised
+// per cluster on (cluster cells, own cells, pieces): nothing outside the cluster matters.
+struct OnePlayer {
+    static constexpr uint64_t DFS_BUDGET = 20000;  // search nodes per cluster; beyond it the answer is "maybe"
+    static constexpr int MEMO_LOG2 = 16;
+    struct MemoEntry { BB cells = 0, own = 0; uint8_t av = 0; int8_t reachable = 0, unreachable = 127; };
+    std::vector<MemoEntry> memo = std::vector<MemoEntry>(size_t(1) << MEMO_LOG2);
+    uint64_t queries = 0, unreachableAnswers = 0, dfsNodes = 0, outOfBudget = 0;
+    void clear() { std::fill(memo.begin(), memo.end(), MemoEntry{}); }
+
+    // false only if c surely cannot reach `target`; cl: c's clusters (snakeClusters)
+    bool mayReach(const Pos& s, int c, const Clusters& cl, int target) {
+        if (s.L[c] >= target) return true;
+        uint8_t av = s.avail[c];
+        if (!av) return false;
+        queries++;
+        for (int i = 0; i < cl.n; i++) {
+            if (cl.ub[i] < target) continue;
+            BB K = cl.cells[i], ownK = s.own[c] & K;
+            uint64_t h = (uint64_t)K * 0x9E3779B97F4A7C15ULL ^ (uint64_t)(K >> 64) * 0xC2B2AE3D27D4EB4FULL ^
+                         (uint64_t)ownK * 0x165667B19E3779F9ULL ^ (uint64_t)(ownK >> 64) * 0x27D4EB2F165667C5ULL ^ av * 0x85EBCA77C2B2AE63ULL;
+            MemoEntry& e = memo[(h ^ (h >> 29)) & (memo.size() - 1)];
+            if (e.cells != K || e.own != ownK || e.av != av) e = MemoEntry{K, ownK, av, 0, 127};
+            if (e.reachable >= target) return true;
+            if (e.unreachable <= target) continue;
+            BB comps[8];
+            int nc = 0;
+            for (int j = 0; j < s.ncomp[c]; j++) if (s.comp[c][j] & K) comps[nc++] = s.comp[c][j];
+            int r = reachIn(ownK, K & ~s.own[c], comps, nc, av, target);
+            if (r != 0) {
+                if (r == 1) e.reachable = (int8_t)target;
+                else outOfBudget++;
+                return true;
+            }
+            e.unreachable = (int8_t)target;
+        }
+        unreachableAnswers++;
+        return false;
+    }
+
+  private:
+    BB own = 0, freeCells = 0;  // own cells of the cluster, its growable cells
+    BB comps[8];
+    int ncomp = 0, compLen[8];
+    int target = 0;
+    bool newOnly = false;       // a path of new pieces only: it never touches an old snake
+    int minPiece = 0;           // ... and its other pieces have a higher index than its seed piece
+    int seedComp = -1;          // the seed snake: snakes with a lower index are not merged
+    uint64_t used = 0;
+
+    // 1 reachable, 0 not, -1 out of budget. P: the path (a component of M), keptEnd: the end not
+    // extended now; secondEnd: the first end is finished and the other one is being extended.
+    int dfs(BB P, BB M, BB placed, uint8_t av, int keptEnd, bool secondEnd) {
+        int len = popc(P);
+        if (len >= target) return 1;
+        if (!av) return 0;
+        if (++used > DFS_BUDGET) return -1;
+        // cheap count first: every remaining piece and the longest snakes it could merge
+        int quick = len + remainingCells(av);
+        if (!newOnly) {
+            int k = pieceCount(av), lens[8], m = 0;
+            for (int j = 0; j < ncomp; j++) if (!(comps[j] & P)) lens[m++] = compLen[j];
+            std::sort(lens, lens + m, std::greater<int>());
+            for (int j = 0; j < std::min(k, m); j++) quick += lens[j];
+        }
+        if (quick < target) return 0;
+        Shape sm = shapeOf(M);
+        BB E = P & sm.ends;  // P is a component of M
+        if (!E) return 0;    // a ring
+        int a = popc(E) == 1 ? lsb(E) : (E & ~bit(keptEnd)) ? lsb(E & ~bit(keptEnd)) : lsb(E);
+        BB active = secondEnd ? bit(a) : E;
+        // with one piece left, placing it at either active end is the last step
+        bool lastPiece = (av & (av - 1)) == 0;
+        int childKept = popc(E) == 1 ? a : keptEnd;
+        BB extendAt = lastPiece ? active : bit(a);
+        int e0 = lsb(extendAt), e1 = extendAt & (extendAt - 1) ? lsb(extendAt & (extendAt - 1)) : e0;
+        // legal extensions, bit-parallel per orientation: orientLegal's grow rules with "touches
+        // own" narrowed to "touches the end being extended"
+        BB A = freeCells & ~placed;
+        if (newOnly) A &= ~expand(own);
+        BB base = A & ~expand(sm.full);
+        BB allow[3] = {base & ~sm.ge3 & ~sm.tri2, base & ~sm.ge2, base & ~sm.ge1};
+        BB meDeg1 = M & sm.ge1;
+        int result = 0;
+        for (int p = NPIECE - 1; p >= 0; p--) {  // big pieces first: a path that reaches is found sooner
+            if (!(av >> p & 1) || (newOnly && p <= minPiece)) continue;
+            for (int o = T.orBegin[p]; o < T.orBegin[p + 1]; o++) {
+                const Orient& od = T.OR[o];
+                BB gr = od.nextTo[e0] | od.nextTo[e1];
+                for (int k = 0; k < od.n && gr; k++) gr &= shiftFrom(allow[od.ideg[k]], od.dq[k], od.dr[k]);
+                if (!gr) continue;
+                for (auto [q, r] : od.tri) gr &= ~shiftFrom(M, q, r);
+                for (auto [q, r] : od.two) gr &= ~shiftFrom(meDeg1, q, r);
+                while (gr) {
+                    int anchor = lsb(gr);
+                    gr &= gr - 1;
+                    const Placement& pl = T.PL[p][T.gidInfo[od.gidAt[anchor]].second];
+                    // the piece joins P and every old snake it touches
+                    BB P2 = P | pl.m;
+                    bool lower = false;
+                    for (int j = 0; j < ncomp; j++)
+                        if ((comps[j] & pl.nb) && !(comps[j] & P)) {
+                            if (!newOnly && j < seedComp) lower = true;
+                            P2 |= comps[j];
+                        }
+                    if (lastPiece) {
+                        if (popc(P2) >= target) return 1;
+                        continue;
+                    }
+                    if (lower) continue;
+                    int r = dfs(P2, M | pl.m, placed | pl.m, (uint8_t)(av & ~(1u << p)), childKept, secondEnd);
+                    if (r == 1) return 1;
+                    if (r < 0) result = -1;
+                    if (used > DFS_BUDGET) return -1;
+                }
+            }
+        }
+        if (!lastPiece && !secondEnd && popc(E) == 2) {
+            int r = dfs(P, M, placed, av, a, true);
+            if (r != 0) return r;
+        }
+        return result;
+    }
+
+    // The decision inside one cluster: own cells, free growable cells, its snakes.
+    int reachIn(BB own_, BB free_, const BB* comps_, int ncomp_, uint8_t av, int target_) {
+        target = target_;
+        own = own_;
+        freeCells = free_;
+        ncomp = ncomp_;
+        for (int j = 0; j < ncomp; j++) { comps[j] = comps_[j]; compLen[j] = popc(comps[j]); }
+        used = 0;
+        int r = searchSeeds(av);
+        dfsNodes += used;
+        return r;
+    }
+    int searchSeeds(uint8_t av) {
+        int result = 0;
+        // seeds: the old snakes
+        newOnly = false;
+        for (int j = 0; j < ncomp; j++) {
+            seedComp = j;
+            BB E = shapeOf(comps[j]).ends;
+            if (!E) continue;
+            int r = dfs(comps[j], own, 0, av, lsb(E), false);
+            if (r == 1) return 1;
+            if (r < 0) result = -1;
+            if (used > DFS_BUDGET) return -1;
+        }
+        // seeds: paths of new pieces only, seeded by their lowest piece. Such a path lies in one
+        // region of the growable cells away from the old snakes, which must hold target cells.
+        if (remainingCells(av) < target) return result;
+        newOnly = true;
+        BB fr = freeCells & ~expand(own), ok = 0;
+        for (BB rest = fr; rest;) {
+            BB r = flood(bit(lsb(rest)), fr);
+            rest &= ~r;
+            if (T.fit[av][std::min(popc(r), NIDX)] >= target) ok |= r;
+        }
+        if (!ok) return result;
+        for (int p = 0; p < NPIECE; p++) {
+            if (!(av >> p & 1)) continue;
+            uint8_t higher = (uint8_t)(av & ~((2u << p) - 1));
+            if (PIECE_CELLS[p] + remainingCells(higher) < target) continue;
+            minPiece = p;
+            for (int o = T.orBegin[p]; o < T.orBegin[p + 1]; o++) {
+                const Orient& od = T.OR[o];
+                BB anchors = T.VALID;
+                for (int k = 0; k < od.n; k++) anchors &= shiftFrom(ok, od.dq[k], od.dr[k]);
+                while (anchors) {
+                    int anchor = lsb(anchors);
+                    anchors &= anchors - 1;
+                    const Placement& pl = T.PL[p][T.gidInfo[od.gidAt[anchor]].second];
+                    int r = dfs(pl.m, own | pl.m, pl.m, higher, lsb(shapeOf(pl.m).ends), false);
+                    if (r == 1) return 1;
+                    if (r < 0) result = -1;
+                    if (used > DFS_BUDGET) return -1;
+                }
+            }
+        }
+        return result;
+    }
+};
+
 inline int finalScore(const Pos& s) {  // from player 1's perspective: >0 player 1 wins
     return s.L[0] - s.L[1];
 }

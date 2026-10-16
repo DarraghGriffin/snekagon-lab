@@ -484,7 +484,8 @@ int main(int argc, char** argv) {
         auto t0 = std::chrono::steady_clock::now();
         std::vector<std::thread> th;
         std::mutex profMu;
-        uint64_t profV[16] = {}, profT[16] = {}, profB[16] = {}, profE[16] = {}, profP[16] = {}, profM[16] = {}, profL[16] = {}, profS[16] = {}, profSH[16] = {}, profTime[16] = {}, profPart[16][NPART] = {};
+        uint64_t profV[16] = {}, profT[16] = {}, profB[16] = {}, profE[16] = {}, profP[16] = {}, profM[16] = {}, profL[16] = {}, profS[16] = {}, profSH[16] = {}, profTC[16] = {}, profTime[16] = {}, profPart[16][NPART] = {};
+        uint64_t opQueries = 0, opNo = 0, opDfs = 0, opBudget = 0, opCycles = 0;  // one-player queries, "cannot reach" answers, search nodes, out of budget, cycles
         int sharedLog2 = envInt("SOLVER_SHARED", 0);
         std::shared_ptr<LTT> shared = sharedLog2 ? std::make_shared<LTT>(sharedLog2 - 1) : nullptr;
         bool fresh = envInt("BENCH_FRESH", 0) != 0;
@@ -517,10 +518,13 @@ int main(int argc, char** argv) {
                         for (int p = 0; p < 16; p++) {
                             profV[p] += S.pVisit[p]; profT[p] += S.pTT[p]; profB[p] += S.pBound[p]; profE[p] += S.pExp[p];
                             profP[p] += S.pPruned[p]; profM[p] += S.pMoves[p]; profL[p] += S.pLast[p]; profS[p] += S.pScans[p]; profSH[p] += S.pScanHits[p]; S.pScans[p] = S.pScanHits[p] = 0;
+                            profTC[p] += S.pTight[p]; S.pTight[p] = 0;
 #ifdef SOLVER_TIMING
                             profTime[p] += S.pTime[p]; S.pTime[p] = 0; for (int q = 0; q < NPART; q++) { profPart[p][q] += S.pPart[p][q]; S.pPart[p][q] = 0; }
 #endif
                         }
+                        opQueries += S.onePlayer.queries; opNo += S.onePlayer.unreachableAnswers; opDfs += S.onePlayer.dfsNodes; opCycles += S.reachCycles; opBudget += S.onePlayer.outOfBudget;
+                        S.onePlayer.queries = S.onePlayer.unreachableAnswers = S.onePlayer.dfsNodes = S.onePlayer.outOfBudget = S.reachCycles = 0;
                         std::fill(S.pVisit, S.pVisit + 16, 0); std::fill(S.pTT, S.pTT + 16, 0);
                         std::fill(S.pBound, S.pBound + 16, 0); std::fill(S.pExp, S.pExp + 16, 0);
                         std::fill(S.pPruned, S.pPruned + 16, 0); std::fill(S.pMoves, S.pMoves + 16, 0); std::fill(S.pLast, S.pLast + 16, 0);
@@ -538,13 +542,19 @@ int main(int argc, char** argv) {
         }
         printf("TOTAL %zu positions: %llu nodes, %.1f thread-seconds, %.1f s wall (%d threads)\n", ps.size(), (unsigned long long)tn, ts, wall, threads);
         if (getenv("PROFILE")) {
-            printf("ply     visited    tt-cut  last-pcs  bound-cut  expanded  threat-skip     scans  found\n");
+            printf("ply     visited    tt-cut  last-pcs  bound-cut  tight-cut  expanded  threat-skip     scans  found\n");
             for (int p = 0; p < 16; p++)
                 if (profV[p])
-                    printf("%3d %11llu %9.1f%% %8.1f%% %9.1f%% %9.1f%% %9.1f%% %9llu %5.1f%%\n", p, (unsigned long long)profV[p], 100.0 * profT[p] / profV[p],
-                           100.0 * profL[p] / profV[p], 100.0 * profB[p] / profV[p], 100.0 * profE[p] / profV[p],
+                    printf("%3d %11llu %9.1f%% %8.1f%% %9.1f%% %9.1f%% %9.1f%% %9.1f%% %9llu %5.1f%%\n", p, (unsigned long long)profV[p], 100.0 * profT[p] / profV[p],
+                           100.0 * profL[p] / profV[p], 100.0 * profB[p] / profV[p], 100.0 * profTC[p] / profV[p], 100.0 * profE[p] / profV[p],
                            profP[p] + profM[p] ? 100.0 * profP[p] / (profP[p] + profM[p]) : 0.0,
                            (unsigned long long)profS[p], profS[p] ? 100.0 * profSH[p] / profS[p] : 0.0);
+            printf("one-player queries %llu, cannot reach %.1f%%, %.1f search nodes per query, %llu out of budget", (unsigned long long)opQueries,
+                   opQueries ? 100.0 * opNo / opQueries : 0.0, opQueries ? (double)opDfs / opQueries : 0.0, (unsigned long long)opBudget);
+#ifdef SOLVER_TIMING
+            printf(", %.0f cycles per query", opQueries ? (double)opCycles / opQueries : 0.0);
+#endif
+            printf("\n");
 #ifdef SOLVER_TIMING
             uint64_t tt = 0;
             for (int p = 0; p < 16; p++) tt += profTime[p];

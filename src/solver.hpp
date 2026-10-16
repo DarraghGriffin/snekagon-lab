@@ -54,8 +54,12 @@ inline int envInt(const char* name, int def) { const char* v = getenv(name); ret
 // With it, "blue still wins" means blue wins by more than b: used to find the exact margin of a line.
 inline const int RED_BONUS = envInt("SOLVER_RED_BONUS", 0);
 
-enum { PART_TT, PART_LAST, PART_BOUNDS, PART_KILLER_THREATS, PART_MOVEGEN, PART_SCAN, PART_CHILD, NPART };
-inline const char* PART_NAMES[NPART] = {"tt", "lastPieces", "bounds", "killerThreats", "movegen", "scan", "childMake"};
+enum { PART_TT, PART_LAST, PART_BOUNDS, PART_TIGHT_BOUNDS, PART_KILLER_THREATS, PART_MOVEGEN, PART_SCAN, PART_CHILD, NPART };
+inline const char* PART_NAMES[NPART] = {"tt", "lastPieces", "bounds", "tightBounds", "killerThreats", "movegen", "scan", "childMake"};
+
+// The tight bounds (guaranteed growth and the exact one-player optimum, Solver::tightenBounds) are
+// used once at most this many pieces are left in total: higher up, a query costs more than it saves.
+constexpr int TIGHT_BOUNDS_MAX_PIECES = 5;
 
 struct Solver {
     std::shared_ptr<LTT> tt;
@@ -79,20 +83,24 @@ struct Solver {
     int evalOrderRemWin = envInt("SOLVER_EVAL_WIN_REM", 7);
     double evalWinThreshold = envInt("SOLVER_EVAL_WIN_THR", -100) / 100.0;
     int etcRem = envInt("SOLVER_ETC_REM", 99);        // enhanced transposition cutoffs when >= this many pieces are left
+    int tightRem = envInt("SOLVER_TIGHT_REM", TIGHT_BOUNDS_MAX_PIECES);  // tight bounds when <= this many pieces are left
+    OnePlayer onePlayer;
+    uint64_t pTight[16] = {};  // nodes cut by the tight bounds, per ply
 
     // log2size: log2 of the number of entries (16 bytes each)
     explicit Solver(int log2size = 22) : tt(std::make_shared<LTT>(log2size - 1)) { init(); }
     explicit Solver(std::shared_ptr<LTT> shared) : tt(std::move(shared)) { init(); }
-    std::vector<Move> mvBuf[32];
+    std::vector<Move> mvBuf[32], legalBuf[32];
     std::vector<int> scBuf[32];
     std::vector<uint64_t> sortBuf[32];
     static constexpr int FULL_SORT_AFTER = 3;
     void init() {
-        for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); scBuf[i].resize(3000); sortBuf[i].resize(3000); }
+        for (int i = 0; i < 32; i++) { mvBuf[i].resize(3000); legalBuf[i].resize(3000); scBuf[i].resize(3000); sortBuf[i].resize(3000); }
         std::memset(killer, -1, sizeof killer);
     }
     void clear() {
         tt->clear();
+        onePlayer.clear();
         std::memset(killer, -1, sizeof killer);
     }
 
@@ -131,14 +139,28 @@ struct Solver {
         bool grows = b.nb & s.own[s.stm ^ 1];
         return grows ? b.m : b.m | b.nb;
     }
-    // Adds the opponent placement gid as a threat if it is one (value <= 0).
-    static void addThreat(const Pos& s, int gid, Threat* threats, int& n, int* tried, int& nTried) {
+    // Adds the opponent placement gid as a threat if it is one (value <= 0). With `exact`, our
+    // bound after it is the one-player optimum, which is sound in the same way: whatever we play
+    // that leaves b playable, every continuation is one that the relaxation after b allows.
+    void addThreat(const Pos& s, int gid, Threat* threats, int& n, int* tried, int& nTried, bool exact) {
         if (gid < 0 || n >= MAX_THREATS || nTried >= MAX_TRIED) return;
         for (int i = 0; i < nTried; i++) if (tried[i] == gid) return;
         tried[nTried++] = gid;
         auto [p, idx] = T.gidInfo[gid];
         const Placement& b = T.PL[p][idx];
         int v = threatValue(s, b, p);
+        if (exact && (v == 0 || v == 1)) {
+            int me = s.stm, opp = me ^ 1;
+            int bonus = me == 0 ? RED_BONUS : -RED_BONUS;
+            Pos after = s;
+            after.own[opp] |= b.m;
+            Clusters cl;
+            int lb, ub;
+            snakeClusters(after, me, lb, ub, cl);
+            int lenOpp = lengthAfter(s, opp, b);
+            if (v == 1 && !mayReach(after, me, cl, lenOpp - bonus + 1)) v = 0;
+            if (v == 0 && !mayReach(after, me, cl, lenOpp - bonus)) v = -1;
+        }
         if (v <= 0) threats[n++] = Threat{threatZone(s, b), v};
     }
     // Every opponent placement that is a threat for the current window, cheapest test first:
@@ -247,6 +269,83 @@ struct Solver {
         return best;
     }
 
+    // Guaranteed growth: lower bounds on both final snakes, one and two plies ahead.
+    //  - The side to move reaches at least the longest snake of its best move now (lenMe).
+    //  - The opponent reaches at least the length that none of our moves prevents (lenOpp): some
+    //    placement of its that reaches it stays legal after any single move of ours (a grow
+    //    placement unless we cover it, a new snake unless we cover or touch it). Our move only
+    //    removes opponent placements, never adds any; if we have to pass, every one stays.
+    // legal: every legal move of the side to move.
+    static void growthBounds(const Pos& s, const Move* legal, int nLegal, int& lenMe, int& lenOpp) {
+        int me = s.stm, opp = me ^ 1;
+        lenMe = s.L[me];
+        for (int i = 0; i < nLegal; i++) lenMe = std::max(lenMe, lengthAfter(s, me, legal[i].pl()));
+        lenOpp = s.L[opp];
+        if (!s.avail[opp]) return;
+        struct Extension { BB block; int len; };  // block: our cells that make it illegal
+        constexpr int MAX_EXTENSIONS = 512;
+        Extension ext[MAX_EXTENSIONS];
+        int ne = 0;
+        Pos asOpp = s;
+        asOpp.stm = (uint8_t)opp;
+        BB occ = s.occ();
+        auto add = [&](Move q) {
+            const Placement& pl = q.pl();
+            int len = lengthAfter(s, opp, pl);
+            if (len > s.L[opp] && ne < MAX_EXTENSIONS) ext[ne++] = Extension{pl.nb & occ ? pl.m : pl.m | pl.nb, len};
+        };
+        // a new snake is longer only while the opponent's snakes are shorter than a piece
+        if (s.L[opp] >= PIECE_CELLS[P4C]) asOpp.forEachLegalGrow(add);
+        else asOpp.forEachLegal(add);
+        if (!ne) return;
+        std::sort(ext, ext + ne, [](const Extension& a, const Extension& b) { return a.len > b.len; });
+        lenOpp = ext[0].len;  // if we have to pass, every placement stays
+        for (int i = 0; i < nLegal && lenOpp > s.L[opp]; i++) {
+            BB m = legal[i].pl().m;
+            int best = s.L[opp];
+            for (int j = 0; j < ne && ext[j].len > best; j++)
+                if (!(ext[j].block & m)) { best = ext[j].len; break; }
+            lenOpp = std::min(lenOpp, best);
+        }
+    }
+
+    // Narrows [lo, hi] with the growth bounds and the exact one-player optimum, asking only the
+    // questions whose answer would end the node in the window (alpha, beta). lbMe/ubMe include
+    // our share of RED_BONUS (bonus); legal: every legal move of ours; myCl/oppCl: the clusters.
+    void tightenBounds(const Pos& s, const Move* legal, int nLegal, int& lo, int& hi, int alpha, int beta,
+                       int lbMe, int ubMe, int lbOp, int ubOp, int bonus, const Clusters& myCl, const Clusters& oppCl) {
+        int me = s.stm, opp = me ^ 1;
+        int lenMe, lenOpp;
+        growthBounds(s, legal, nLegal, lenMe, lenOpp);
+        lbMe = std::max(lbMe, lenMe + bonus);
+        lbOp = std::max(lbOp, lenOpp);
+        lo = std::max(lo, lbMe > ubOp ? 1 : lbMe >= ubOp ? 0 : -1);
+        hi = std::min(hi, ubMe < lbOp ? -1 : ubMe <= lbOp ? 0 : 1);
+        auto decided = [&] { return lo >= hi || lo >= beta || hi <= alpha; };
+        if (decided()) return;
+        // our optimum against the opponent's guaranteed length lowers hi: to 0 if we cannot pass
+        // it (a cutoff only when alpha >= 0 or lo >= 0), to -1 if we cannot reach it
+        if (hi == 1 && (alpha >= 0 || lo >= 0) && !mayReach(s, me, myCl, lbOp - bonus + 1)) hi = 0;
+        if (decided()) return;
+        if ((hi == 0 || alpha == -1) && !mayReach(s, me, myCl, lbOp - bonus)) hi = -1;
+        if (decided()) return;
+        // the opponent's optimum against our guaranteed length raises lo the same way
+        if (lo == -1 && (beta <= 0 || hi <= 0) && !mayReach(s, opp, oppCl, lbMe + 1)) lo = 0;
+        if (decided()) return;
+        if ((lo == 0 || beta == 1) && !mayReach(s, opp, oppCl, lbMe)) lo = 1;
+    }
+    uint64_t reachCycles = 0;  // time in the one-player queries (-DSOLVER_TIMING builds)
+    bool mayReach(const Pos& s, int c, const Clusters& cl, int target) {
+#ifdef SOLVER_TIMING
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        bool r = onePlayer.mayReach(s, c, cl, target);
+        reachCycles += __builtin_ia32_rdtsc() - t0;
+        return r;
+#else
+        return onePlayer.mayReach(s, c, cl, target);
+#endif
+    }
+
     bool checkAbort() {
         if (aborted) return true;
         if ((nodes & 4095) == 0) {
@@ -310,9 +409,11 @@ struct Solver {
         }
         // snake-length bound cutoffs
         int lbMe, ubMe, lbOp, ubOp;
-        Clusters myClusters;  // kept for the threat scan
-        TIMED(PART_BOUNDS, if (useThreats) snakeClusters(s, s.stm, lbMe, ubMe, myClusters); else snakeBounds(s, s.stm, lbMe, ubMe);
-                           snakeBounds(s, s.stm ^ 1, lbOp, ubOp));
+        int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
+        bool tight = rem <= tightRem;
+        Clusters myClusters, oppClusters;  // kept for the threat scan and the tight bounds
+        TIMED(PART_BOUNDS, if (useThreats || tight) snakeClusters(s, s.stm, lbMe, ubMe, myClusters); else snakeBounds(s, s.stm, lbMe, ubMe);
+                           if (tight) snakeClusters(s, s.stm ^ 1, lbOp, ubOp, oppClusters); else snakeBounds(s, s.stm ^ 1, lbOp, ubOp));
         int bonus = s.stm == 0 ? RED_BONUS : -RED_BONUS;  // the side to move's share of SOLVER_RED_BONUS
         lbMe += bonus;
         ubMe += bonus;
@@ -322,16 +423,29 @@ struct Solver {
         hi = std::min(hi, bhi);
         if (lo >= hi || lo >= beta) { pBound[pp]++; return lo; }
         if (hi <= alpha) { pBound[pp]++; return hi; }
+
+        // per-depth move buffers (no per-node initialisation of 3000-element arrays)
+        Move* moves = mvBuf[s.ply & 31].data();
+        int* score = scBuf[s.ply & 31].data();
+        int n = 0;
+        // the tight bounds need every legal move of ours (the growth bounds), which the search then reuses
+        Move* legal = legalBuf[s.ply & 31].data();
+        int nLegal = 0;
+        if (tight) {
+            TIMED(PART_TIGHT_BOUNDS, s.forEachLegal([&](Move m) { legal[nLegal++] = m; });
+                                     tightenBounds(s, legal, nLegal, lo, hi, alpha, beta, lbMe, ubMe, lbOp, ubOp, bonus, myClusters, oppClusters));
+            if (lo >= hi || lo >= beta || hi <= alpha) {
+                pTight[pp]++;
+                tt->store(k, lo, hi, eBest, 0);
+                return lo >= hi || lo >= beta ? lo : hi;
+            }
+        }
         pExp[pp]++;
         alpha = std::max(alpha, lo);
         beta = std::min(beta, hi);
         int a0 = alpha, b0 = beta;
 
         // generate + order
-        // per-depth move buffers (no per-node initialisation of 3000-element arrays)
-        Move* moves = mvBuf[s.ply & 31].data();
-        int* score = scBuf[s.ply & 31].data();
-        int n = 0;
         BB me = s.own[s.stm];
         BB opp = s.own[s.stm ^ 1];
         BB oppFront = expand(shapeOf(opp).ends) & s.empty();
@@ -343,14 +457,14 @@ struct Solver {
         int skipped = -2;  // best bound of the moves skipped because of threats
         bool threatsOn = useThreats && s.avail[s.stm ^ 1] && ply < 31;
         if (threatsOn) {
-            TIMED(PART_KILLER_THREATS, addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
-                                       addThreat(s, killer[ply + 1][1], threats, nThreats, tried, nTried));
+            TIMED(PART_KILLER_THREATS, addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried, tight);
+                                       addThreat(s, killer[ply + 1][1], threats, nThreats, tried, nTried, tight));
         }
 #ifdef SOLVER_TIMING
         uint64_t genT0 = __builtin_ia32_rdtsc();
 #endif
         bool scanned = !threatsOn || !threatScan;
-        s.forEachLegal([&](Move m) {
+        auto addMove = [&](Move m) {
             const Placement& pl = m.pl();
             if (nThreats) {
                 int tb = threatBound(pl.m, threats, nThreats);
@@ -364,11 +478,12 @@ struct Solver {
             else if (m.gid == k1) sc = 1 << 29;
             else if (m.gid == k2) sc = 1 << 28;
             moves[n] = m; score[n] = sc; n++;
-        });
+        };
+        if (tight) for (int i = 0; i < nLegal; i++) addMove(legal[i]);
+        else s.forEachLegal(addMove);
 #ifdef SOLVER_TIMING
         pPart[pp][PART_MOVEGEN] += __builtin_ia32_rdtsc() - genT0;
 #endif
-        int rem = pieceCount(s.avail[0]) + pieceCount(s.avail[1]);
         bool doEval = n > 1 && (rem >= evalOrderRem || (rem >= evalOrderRemWin && learnedLogit(s) > evalWinThreshold));
         bool doEtc = n > 0 && rem >= etcRem;
         // moves scored at least `ahead` (the table move, and the killers unless killersOverEval is off)
@@ -439,7 +554,7 @@ struct Solver {
                 // first move failed, this is probably a node where every move must be refuted, so
                 // look for all the opponent's threats
                 if (threatsOn && i + 2 < n) {
-                    addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried);
+                    addThreat(s, killer[ply + 1][0], threats, nThreats, tried, nTried, tight);
                     if (!scanned) {
                         scanned = true;
                         int before = nThreats;
