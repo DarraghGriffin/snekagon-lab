@@ -57,9 +57,11 @@ inline const int RED_BONUS = envInt("SOLVER_RED_BONUS", 0);
 enum { PART_TT, PART_LAST, PART_BOUNDS, PART_TIGHT_BOUNDS, PART_KILLER_THREATS, PART_MOVEGEN, PART_SCAN, PART_CHILD, NPART };
 inline const char* PART_NAMES[NPART] = {"tt", "lastPieces", "bounds", "tightBounds", "killerThreats", "movegen", "scan", "childMake"};
 
-// The tight bounds (guaranteed growth and the exact one-player optimum, Solver::tightenBounds) are
-// used once at most this many pieces are left in total: higher up, a query costs more than it saves.
-constexpr int TIGHT_BOUNDS_MAX_PIECES = 5;
+// The tight bounds (guaranteed growth and the exact one-player optimum, Solver::tightenBounds) cost
+// more than they save higher up: they are used at every node once at most TIGHT_BOUNDS_MAX_PIECES
+// pieces are left in total, and with up to ALL_NODE_TIGHT_BOUNDS_MAX_PIECES only once a node's first
+// move failed, where every remaining move would have to be searched.
+constexpr int TIGHT_BOUNDS_MAX_PIECES = 5, ALL_NODE_TIGHT_BOUNDS_MAX_PIECES = 6;
 
 struct Solver {
     std::shared_ptr<LTT> tt;
@@ -84,6 +86,7 @@ struct Solver {
     double evalWinThreshold = envInt("SOLVER_EVAL_WIN_THR", -100) / 100.0;
     int etcRem = envInt("SOLVER_ETC_REM", 99);        // enhanced transposition cutoffs when >= this many pieces are left
     int tightRem = envInt("SOLVER_TIGHT_REM", TIGHT_BOUNDS_MAX_PIECES);  // tight bounds when <= this many pieces are left
+    int tightAllNodeRem = envInt("SOLVER_TIGHT_ALL_REM", ALL_NODE_TIGHT_BOUNDS_MAX_PIECES);  // ... and at all-nodes up to this
     OnePlayer onePlayer;
     uint64_t pTight[16] = {};  // nodes cut by the tight bounds, per ply
 
@@ -334,6 +337,15 @@ struct Solver {
         if (decided()) return;
         if ((lo == 0 || beta == 1) && !mayReach(s, opp, oppCl, lbMe)) lo = 1;
     }
+    // tightenBounds for the moves `rest` of the side to move only: [lo, hi] bounds the best of them
+    // (the growth bounds hold move by move). The clusters are computed here when the node has not.
+    void restBounds(const Pos& s, const Move* rest, int nRest, int& lo, int& hi, int alpha, int beta, int lbMe, int ubMe,
+                    int lbOp, int ubOp, int bonus, Clusters& myCl, Clusters& oppCl) {
+        int l, u;
+        if (!useThreats) snakeClusters(s, s.stm, l, u, myCl);
+        snakeClusters(s, s.stm ^ 1, l, u, oppCl);
+        tightenBounds(s, rest, nRest, lo, hi, alpha, beta, lbMe, ubMe, lbOp, ubOp, bonus, myCl, oppCl);
+    }
     uint64_t reachCycles = 0;  // time in the one-player queries (-DSOLVER_TIMING builds)
     bool mayReach(const Pos& s, int c, const Clusters& cl, int target) {
 #ifdef SOLVER_TIMING
@@ -464,6 +476,7 @@ struct Solver {
         uint64_t genT0 = __builtin_ia32_rdtsc();
 #endif
         bool scanned = !threatsOn || !threatScan;
+        bool allNodeChecked = tight || rem > tightAllNodeRem;
         auto addMove = [&](Move m) {
             const Placement& pl = m.pl();
             if (nThreats) {
@@ -549,6 +562,15 @@ struct Solver {
                 if (alpha >= beta) {
                     if (killer[ply][0] != moves[i].gid) { killer[ply][1] = killer[ply][0]; killer[ply][0] = moves[i].gid; }
                     break;
+                }
+                // the first move failed: above the gate, the tight bounds over the moves left may
+                // settle them all at once
+                if (!allNodeChecked && i + 2 < n) {
+                    allNodeChecked = true;
+                    int restLo = -1, restHi = 1;
+                    TIMED(PART_TIGHT_BOUNDS, restBounds(s, moves + i + 1, n - i - 1, restLo, restHi, alpha, beta, lbMe, ubMe, lbOp, ubOp, bonus, myClusters, oppClusters));
+                    if (restHi <= alpha) { pTight[pp]++; best = std::max(best, restHi); break; }
+                    if (restLo >= beta) { pTight[pp]++; best = restLo; break; }
                 }
                 // the refutation just found may be a threat against the remaining moves; once the
                 // first move failed, this is probably a node where every move must be refuted, so
